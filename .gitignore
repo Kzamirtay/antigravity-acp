@@ -1,0 +1,22 @@
+# Large binaries and archives
+*.par
+*.zip
+localharness_external
+
+# Temporary auth and log files
+auth_url.txt
+callback_url.txt
+auth_status.json
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+.venv/
+env/
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

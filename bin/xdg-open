@@ -1,0 +1,5 @@
+#!/bin/bash
+URL="$1"
+echo "$URL" > /home/kzamirtay/.local/share/antigravity-acp/auth_url.txt
+echo "[xdg-open] Intercepted URL: $URL" >&2
+powershell.exe -NoProfile -Command "Start-Process '$URL'" < /dev/null > /dev/null 2>&1 &
