@@ -618,9 +618,13 @@ def cmd_auth(args):
     if listener_port:
         print(f"Local callback listener is active on port: {listener_port}")
     print("=" * 70)
-    print("Waiting for authentication callback...\n")
-    print("(If the browser shows 'connection refused' after redirect, copy the full URL")
-    print(f" from the browser's address bar and paste it into {CALLBACK_URL_FILE} or enter it here)\n")
+    print("Ожидание завершения авторизации...")
+    print("Внимание: в WSL2 браузер Windows после входа в Google покажет ошибку подключения")
+    print("(ERR_CONNECTION_REFUSED) — это нормально!")
+    print("\n👉 Скопируйте полный URL из адресной строки браузера")
+    print(f"   (начинается с http://127.0.0.1:{listener_port}/... или http://localhost:{listener_port}/...)")
+    print("   и вставьте его прямо сюда (или запишите в callback_url.txt):")
+    print("=" * 70 + "\n")
 
     # Attempt to open browser
     open_in_browser(auth_url)
@@ -633,15 +637,17 @@ def cmd_auth(args):
         while not stop_event.is_set():
             if sys.stdin.isatty():
                 try:
-                    r, _, _ = select.select([sys.stdin], [], [], 1.0)
+                    r, _, _ = select.select([sys.stdin], [], [], 0.5)
                     if r:
-                        line = sys.stdin.readline().strip()
-                        if line and ("code=" in line or "http" in line):
-                            CALLBACK_URL_FILE.write_text(line, encoding="utf-8")
+                        line = sys.stdin.readline()
+                        if line:
+                            cleaned = line.strip().strip("'\"")
+                            if cleaned and ("code" in cleaned or "http" in cleaned or "127.0.0.1" in cleaned or "localhost" in cleaned):
+                                CALLBACK_URL_FILE.write_text(cleaned, encoding="utf-8")
                 except Exception:
                     pass
             else:
-                time.sleep(1)
+                time.sleep(0.5)
 
     t = threading.Thread(target=input_thread, daemon=True)
     t.start()
@@ -668,31 +674,41 @@ def cmd_auth(args):
                         resp = json.loads(line)
                         if resp.get("id") == 2:
                             if "result" in resp:
-                                print("\n🎉 Authentication successful!")
+                                print("\n🎉 Авторизация успешно завершена! (Authentication successful)")
                                 authenticated = True
                                 break
                             elif "error" in resp:
-                                print(f"\n❌ Authentication failed: {resp['error']}")
+                                print(f"\n❌ Ошибка авторизации: {resp['error']}")
                                 break
                     except json.JSONDecodeError:
                         pass
 
             # Check callback file
             if not delivered_callback and CALLBACK_URL_FILE.exists():
-                cb_raw = CALLBACK_URL_FILE.read_text(encoding="utf-8").strip()
+                cb_raw = CALLBACK_URL_FILE.read_text(encoding="utf-8").strip().strip("'\"")
                 if cb_raw and listener_port:
-                    parsed = urlparse(cb_raw)
-                    target = f"http://127.0.0.1:{listener_port}{parsed.path}"
-                    if parsed.query:
-                        target += f"?{parsed.query}"
-                    print(f"Delivering redirect callback to loopback listener ({target})...")
+                    if cb_raw.startswith("http://") or cb_raw.startswith("https://"):
+                        parsed = urlparse(cb_raw)
+                        path = parsed.path if parsed.path else "/"
+                        query = f"?{parsed.query}" if parsed.query else ""
+                        target = f"http://127.0.0.1:{listener_port}{path}{query}"
+                    elif cb_raw.startswith("/"):
+                        target = f"http://127.0.0.1:{listener_port}{cb_raw}"
+                    elif cb_raw.startswith("?"):
+                        target = f"http://127.0.0.1:{listener_port}/{cb_raw}"
+                    elif "code=" in cb_raw:
+                        target = f"http://127.0.0.1:{listener_port}/?{cb_raw}"
+                    else:
+                        target = f"http://127.0.0.1:{listener_port}/?code={cb_raw}"
+
+                    print(f"\nДоставка коллбека на локальный порт ({target})...")
                     try:
                         req = urllib.request.Request(target, headers={"User-Agent": "curl/7.81.0"})
                         with urllib.request.urlopen(req, timeout=5) as resp:
-                            print(f"Callback delivered (HTTP {resp.status})")
+                            print(f"✓ Коллбек успешно доставлен (HTTP {resp.status})!")
                         delivered_callback = True
                     except Exception as e:
-                        print(f"Callback delivery attempt error: {e}")
+                        print(f"Попытка доставки коллбека: {e}")
 
             time.sleep(0.5)
     finally:
