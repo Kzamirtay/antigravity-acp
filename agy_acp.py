@@ -261,6 +261,43 @@ def get_installed_version_info() -> Optional[Dict[str, Any]]:
     return None
 
 
+def find_agy_cli() -> Optional[Dict[str, Any]]:
+    """Locates the official Google Antigravity CLI ('agy') and retrieves its version."""
+    agy_path = shutil.which("agy")
+    in_path = agy_path is not None
+
+    if not agy_path:
+        candidates = [
+            Path.home() / ".local" / "bin" / "agy",
+            Path.home() / "bin" / "agy",
+            Path("/usr/local/bin/agy"),
+            Path("/usr/bin/agy"),
+        ]
+        for candidate in candidates:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                agy_path = str(candidate)
+                break
+
+    if not agy_path:
+        return None
+
+    version = "unknown"
+    try:
+        res = subprocess.run([agy_path, "--version"], capture_output=True, text=True, timeout=5)
+        if res.returncode == 0 and res.stdout.strip():
+            version = res.stdout.strip().splitlines()[0]
+        elif res.stderr.strip():
+            version = res.stderr.strip().splitlines()[0]
+    except Exception:
+        pass
+
+    return {
+        "path": agy_path,
+        "version": version,
+        "in_path": in_path,
+    }
+
+
 def setup_xdg_open_wrapper():
     """Sets up bin/xdg-open interceptor that non-blockingly captures any passed URL."""
     BIN_DIR.mkdir(parents=True, exist_ok=True)
@@ -921,12 +958,20 @@ def cmd_paseo(args):
 
 
 def cmd_status(args):
-    """Displays health and status of binary, registry, auth, and Paseo."""
+    """Displays health and status of agy CLI, binary, registry, auth, and Paseo."""
     print("=" * 65)
     print("ANTIGRAVITY ACP STATUS CHECK")
     print("=" * 65)
 
-    # 1. Registry check
+    # 1. Google Antigravity CLI check
+    agy = find_agy_cli()
+    if agy:
+        loc = agy["path"] if agy["in_path"] else f"{agy['path']} (⚠️ not in $PATH)"
+        print(f"[AGY CLI]    ✓ Installed (v{agy['version']}, {loc})")
+    else:
+        print("[AGY CLI]    ✗ Not installed ('agy' not found in PATH or ~/.local/bin)")
+
+    # 2. Registry check
     try:
         reg = fetch_registry_info()
         print(f"[Registry]   ✓ Latest {reg['name']} v{reg['version']} ({reg['platform_key']})")
@@ -934,7 +979,7 @@ def cmd_status(args):
         print(f"[Registry]   ! Unable to reach registry: {e}")
         reg = None
 
-    # 2. Binary check
+    # 3. Binary check
     server_bin = get_server_binary_path(reg)
     installed_info = get_installed_version_info()
     inst_ver = installed_info.get("version") if installed_info else "unknown"
@@ -947,7 +992,7 @@ def cmd_status(args):
     else:
         print(f"[Binary]     ✗ Missing at {server_bin}")
 
-    # 3. Auth check
+    # 4. Auth check
     if server_bin.exists():
         is_auth = check_auth_status(server_bin)
         if is_auth:
@@ -957,7 +1002,7 @@ def cmd_status(args):
     else:
         print("[Auth]       ? Skipped (binary missing)")
 
-    # 4. Paseo status (optional client check)
+    # 5. Client integrations status
     print("-" * 65)
     print("Client Integrations:")
     if PASEO_CONFIG.exists():
@@ -988,20 +1033,49 @@ def cmd_status(args):
     return 0
 
 
+def cmd_check_agy(args):
+    """Checks if Google Antigravity CLI ('agy') is installed and functional."""
+    agy = find_agy_cli()
+    if agy:
+        loc = agy["path"] if agy["in_path"] else f"{agy['path']} (⚠️ not in $PATH)"
+        print(f"✓ Google Antigravity CLI ('agy') v{agy['version']} is installed ({loc}).")
+        return 0
+    else:
+        print("❌ Google Antigravity CLI ('agy') is not installed or not in PATH.", file=sys.stderr)
+        print("Install instructions: https://antigravity.google/docs/cli/reference", file=sys.stderr)
+        return 1
+
+
 def cmd_setup(args):
-    """End-to-end ACP setup: install from registry -> auth -> status."""
+    """End-to-end ACP setup: check agy -> install from registry -> auth -> status."""
     ensure_settings_json("oauth-personal")
-    print(">>> Step 1: Checking and fetching binary from ACP Registry...")
+
+    # Step 1: Check Antigravity CLI ('agy')
+    print(">>> Step 1: Checking Google Antigravity CLI ('agy')...")
+    agy = find_agy_cli()
+    if agy:
+        path_note = "" if agy["in_path"] else f" (⚠️ located at {agy['path']}, but not in $PATH; consider adding ~/.local/bin to PATH)"
+        print(f"✓ Google Antigravity CLI ('agy') v{agy['version']} detected: {agy['path']}{path_note}")
+    else:
+        print("\n❌ Error: Google Antigravity CLI ('agy') is not installed or not in PATH!", file=sys.stderr)
+        print("Antigravity ACP is an extension for Google Antigravity and requires the 'agy' CLI.", file=sys.stderr)
+        print("Install instructions: https://antigravity.google/docs/cli/reference", file=sys.stderr)
+        if not getattr(args, "skip_agy_check", False):
+            print("\nTo proceed anyway without 'agy', run with --skip-agy-check.\n", file=sys.stderr)
+            return 1
+        print("Proceeding anyway due to --skip-agy-check...")
+
+    print("\n>>> Step 2: Checking and fetching binary from ACP Registry...")
     ret = cmd_install(args)
     if ret != 0:
         return ret
 
-    print("\n>>> Step 2: Checking authentication...")
+    print("\n>>> Step 3: Checking authentication...")
     ret = cmd_auth(args)
     if ret != 0:
         return ret
 
-    print("\n>>> Step 3: Verifying ACP server status...")
+    print("\n>>> Step 4: Verifying ACP server status...")
     ret = cmd_status(args)
 
     print("\n💡 Antigravity ACP is ready for any ACP client (Zed, Cursor, OpenCode, Paseo, etc.)!")
@@ -1020,7 +1094,12 @@ def main():
     # setup (general ACP setup: install + auth + status)
     p_setup = subparsers.add_parser("setup", help="Run full ACP setup (install from registry, auth, verify)")
     p_setup.add_argument("--force", action="store_true", help="Force re-download and re-auth")
+    p_setup.add_argument("--skip-agy-check", action="store_true", help="Skip checking if Google Antigravity CLI ('agy') is installed")
     p_setup.set_defaults(func=cmd_setup)
+
+    # check-agy (verify agy CLI)
+    p_check_agy = subparsers.add_parser("check-agy", help="Verify Google Antigravity CLI ('agy') installation")
+    p_check_agy.set_defaults(func=cmd_check_agy)
 
     # install
     p_inst = subparsers.add_parser("install", help="Download/update agy_acp_server from ACP Registry")

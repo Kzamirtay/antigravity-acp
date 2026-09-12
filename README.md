@@ -18,9 +18,10 @@ cd ~/.local/share/antigravity-acp
 ```
 
 Команда `./setup.sh` (или `./setup.sh setup`) выполнит:
-1. Запрос к **ACP Registry** и скачивание актуального релиза `agy_acp_server` под вашу ОС и архитектуру.
-2. Авторизацию в Google через протокол ACP (JSON-RPC stdio).
-3. Проверку готовности агента.
+1. Проверку наличия установленного Google Antigravity CLI (`agy`).
+2. Запрос к **ACP Registry** и скачивание актуального релиза `agy_acp_server` под вашу ОС и архитектуру.
+3. Авторизацию в Google через протокол ACP (JSON-RPC stdio).
+4. Проверку готовности агента.
 
 После этого сервер Antigravity полностью готов к работе с любым ACP-клиентом!
 
@@ -32,8 +33,9 @@ cd ~/.local/share/antigravity-acp
 
 | Команда | Назначение |
 |---|---|
-| `./setup.sh` (или `setup`) | **Базовый сетап ACP**: скачивание из реестра + Google OAuth авторизация + проверка |
-| `./setup.sh status` | Проверка реестра, наличия обновлений, локального файла и валидности OAuth-токена |
+| `./setup.sh` (или `setup`) | **Базовый сетап ACP**: проверка `agy` + скачивание из реестра + Google OAuth + проверка |
+| `./setup.sh check-agy` | Проверка наличия и версии Google Antigravity CLI (`agy`) |
+| `./setup.sh status` | Проверка `agy`, реестра, наличия обновлений, локального файла и OAuth-токена |
 | `./setup.sh install [--force]` | Загрузка и распаковка актуального релиза из ACP Registry |
 | `./setup.sh auth [--force]` | Запуск только процесса авторизации (OAuth JSON-RPC) |
 | `./setup.sh run [args...]` | Прямой запуск ACP сервера по `stdio` (для вызова редакторами/агентами) |
