@@ -1,10 +1,15 @@
-# Google Antigravity ACP Integration for Paseo
+# Google Antigravity ACP Manager
 
-Автоматизация интеграции Google Antigravity ACP сервера (`agy_acp_server.par`) с платформой агентов [Paseo](https://getpaseo.com). Включает установку, решение headless/WSL2 OAuth авторизации через JSON-RPC по stdio и настройку конфигурации Paseo.
+Универсальный инструмент для загрузки, авторизации и управления сервером **Google Antigravity ACP** (`agy_acp_server`) по открытому протоколу [Agent Client Protocol](https://agentclientprotocol.com).
+
+Репозиторий решает ключевые задачи:
+- 📦 **Авто-загрузка и обновления**: динамическое получение актуальных бинарников из [официального ACP Registry](https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json) под Linux (x86_64 / ARM64), macOS и Windows.
+- 🔐 **Headless / WSL2 OAuth2**: бесшовное прохождение Google OAuth авторизации через JSON-RPC по stdio с авто-перехватом браузера в WSL2 и поддержкой ручного ввода ссылки редиректа для удаленных/SSH сессий.
+- 🔌 **Интеграция с любыми клиентами**: готовая поддержка [Paseo](https://getpaseo.com), [Zed](https://zed.dev), Cursor и любых ACP-совместимых сред.
 
 ---
 
-## 🚀 Быстрый старт
+## 🚀 Быстрый старт (ACP Сервер)
 
 ```bash
 git clone https://github.com/Kzamirtay/antigravity-acp.git ~/.local/share/antigravity-acp
@@ -12,24 +17,84 @@ cd ~/.local/share/antigravity-acp
 ./setup.sh
 ```
 
-Команда `./setup.sh` выполнит полный цикл в интерактивном режиме:
-1. **Проверка/загрузка** актуального бинарника `agy_acp_server` напрямую из [официального ACP Registry](https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json) под вашу платформу (Linux x86_64/ARM64, macOS, Windows).
-2. **Аутентификация** через протокол ACP (JSON-RPC stdio) с авто-открытием браузера (поддерживает WSL2, Linux, macOS и ручной headless/SSH ввод).
-3. **Настройка Paseo** (`~/.paseo/config.json`) и перезагрузка демона.
-4. **Проверка статуса** доступности агента в `paseo provider ls` и проверка обновлений в реестре.
+Команда `./setup.sh` (или `./setup.sh setup`) выполнит:
+1. Запрос к **ACP Registry** и скачивание актуального релиза `agy_acp_server` под вашу ОС и архитектуру.
+2. Авторизацию в Google через протокол ACP (JSON-RPC stdio).
+3. Проверку готовности агента.
+
+После этого сервер Antigravity полностью готов к работе с любым ACP-клиентом!
+
+---
+
+## 🧭 Команды CLI (`./setup.sh` / `agy_acp.py`)
+
+Инструмент написан на чистом **Python 3** без внешних `pip`-зависимостей.
+
+| Команда | Назначение |
+|---|---|
+| `./setup.sh` (или `setup`) | **Базовый сетап ACP**: скачивание из реестра + Google OAuth авторизация + проверка |
+| `./setup.sh status` | Проверка реестра, наличия обновлений, локального файла и валидности OAuth-токена |
+| `./setup.sh install [--force]` | Загрузка и распаковка актуального релиза из ACP Registry |
+| `./setup.sh auth [--force]` | Запуск только процесса авторизации (OAuth JSON-RPC) |
+| `./setup.sh run [args...]` | Прямой запуск ACP сервера по `stdio` (для вызова редакторами/агентами) |
+| **`./setup.sh paseo`** | **Интеграция с Paseo**: авто-запись провайдера в `~/.paseo/config.json` и `paseo reload` |
+
+---
+
+## 🎯 Подключение к Paseo (отдельная команда)
+
+Для регистрации провайдера Antigravity в платформе [Paseo](https://getpaseo.com) выполните:
+
+```bash
+./setup.sh paseo
+```
+
+Команда автоматически:
+1. Создаст резервную копию `~/.paseo/config.json.bak`.
+2. Добавит секцию `antigravity` в `agents.providers`:
+   ```json
+   "antigravity": {
+     "extends": "acp",
+     "label": "Antigravity",
+     "command": [
+       "/home/<USER>/.local/share/antigravity-acp/agy_acp_server.par"
+     ],
+     "params": {
+       "supportsMcpServers": false
+     }
+   }
+   ```
+3. Перезагрузит конфигурацию демона через `paseo reload` и выведет статус:
+   ```text
+   PROVIDER      LABEL         STATUS     ENABLED   DEFAULT MODE   MODES
+   antigravity   Antigravity   available  Enabled   default        Default, Auto Edit, YOLO
+   ```
+
+*Флаг `--use-registry-args` (или `--use-uid`) опционально добавляет рекомендованные реестром аргументы (например, `--uid=`).*
+
+---
+
+## 🛠 Подключение к другим ACP-клиентам (Zed, Cursor и др.)
+
+Вы можете использовать скомпилированный бинарник напрямую или запускать его через скрипт:
+
+- **Прямой бинарник**:
+  `~/.local/share/antigravity-acp/agy_acp_server.par`
+- **Через CLI-раннер**:
+  `~/.local/share/antigravity-acp/setup.sh run`
 
 ---
 
 ## 💡 Как устроен процесс авторизации
 
-`agy_acp_server.par` работает как ACP-агент (Agent Client Protocol) через стандартные потоки ввода/вывода (`stdin`/`stdout`).
+`agy_acp_server.par` работает как ACP-агент через стандартные потоки ввода/вывода (`stdin`/`stdout`).
 
 ```mermaid
 sequenceDiagram
     participant User as Пользователь / Браузер
     participant Script as agy_acp.py
     participant Server as agy_acp_server.par
-    participant Paseo as Paseo Daemon
+    participant Client as ACP Клиент (Paseo / Zed)
 
     Script->>Server: {"jsonrpc":"2.0","id":1,"method":"initialize",...}
     Server-->>Script: authMethods: ["oauth-personal", ...]
@@ -41,8 +106,8 @@ sequenceDiagram
     Note over Script,User: Если редирект не прошел (headless/SSH):<br/>вставьте URL в консоль скрипта
     Server->>Server: Обмен кода на токены -> сохранение в ~/.gemini/antigravity-acp/
     Server-->>Script: {"jsonrpc":"2.0","id":2,"result":{}}
-    Script->>Paseo: Запись в ~/.paseo/config.json + paseo reload
-    Paseo-->>Script: Провайдер Antigravity: available
+    Note over Script: Агент авторизован и готов к работе
+    Client->>Server: Полноценная работа с агентом по ACP
 ```
 
 ### Трюк с headless / WSL2 / SSH-логином
@@ -52,60 +117,9 @@ sequenceDiagram
 4. В **Headless/SSH** окружении (или если порт не проброшен):
    - Откройте сгенерированную ссылку в любом браузере на любом устройстве.
    - Завершите вход в Google.
-   - Браузер выполнит редирект на `http://localhost:<PORT>/?state=...&code=...` (страница покажет ошибку соединения — это ожидаемо).
+   - Браузер выполнит редирект на `http://localhost:<PORT>/?state=...&code=...` (страница покажет ошибку соединения — это нормально).
    - Скопируйте финальный URL из адресной строки браузера и вставьте его в терминал скрипта (или запишите в `callback_url.txt`).
    - Скрипт мгновенно отправит HTTP GET на локальный листенер, и авторизация завершится успехом.
-
----
-
-## 🛠 Команды CLI (`agy_acp.py` / `setup.sh`)
-
-Скрипт написан на **чистом Python 3** с использованием только стандартной библиотеки — никаких сторонних `pip`-зависимостей не требуется.
-
-| Команда | Описание |
-|---|---|
-| `./setup.sh` или `./agy_acp.py setup` | Полный цикл: скачивание из реестра + логин + конфиг + проверка |
-| `./setup.sh status` | Проверка реестра, наличия обновлений, валидности токенов и статуса Paseo |
-| `./setup.sh install [--force]` | Скачивание и установка актуального релиза из официального ACP Registry |
-| `./setup.sh auth [--force]` | Запуск только процесса OAuth-авторизации |
-| `./setup.sh config [--use-registry-args]` | Запись настроек в `~/.paseo/config.json` (с флагами из реестра) и `paseo reload` |
-
----
-
-## ⚙️ Ручная настройка конфигурации Paseo
-
-Если вы предпочитаете сконфигурировать `~/.paseo/config.json` вручную, добавьте провайдера в секцию `agents.providers`:
-
-```json
-{
-  "agents": {
-    "providers": {
-      "antigravity": {
-        "extends": "acp",
-        "label": "Antigravity",
-        "command": [
-          "/home/<USER>/.local/share/antigravity-acp/agy_acp_server.par"
-        ],
-        "params": {
-          "supportsMcpServers": false
-        }
-      }
-    }
-  }
-}
-```
-
-После редактирования перезагрузите демон Paseo:
-```bash
-paseo reload
-paseo provider ls
-```
-
-Ожидаемый вывод:
-```text
-PROVIDER      LABEL             STATUS        ENABLED     DEFAULT MODE    MODES
-antigravity   Antigravity       available     Enabled     default         Default, Auto Edit, YOLO
-```
 
 ---
 

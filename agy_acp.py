@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Antigravity ACP Helper CLI
-Automates downloading latest releases from the ACP Registry,
-headless JSON-RPC OAuth authentication, and Paseo integration for Google Antigravity ACP Server.
+General-purpose manager for Google Antigravity ACP (Agent Client Protocol) server:
+automated downloading from official ACP Registry, headless/WSL2 OAuth authentication,
+status health-checks, ACP proxying, and client integrations (Paseo, Zed, etc.).
 """
 
 import argparse
@@ -19,7 +20,7 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 import zipfile
 
@@ -133,7 +134,7 @@ def fetch_registry_info() -> Dict[str, Any]:
                 json.dump(data, f, indent=2)
         except Exception:
             pass
-    except Exception as e:
+    except Exception:
         # Try local cache
         if REGISTRY_CACHE_FILE.exists():
             try:
@@ -282,7 +283,7 @@ def cmd_install(args):
 
     print(f"Registry: {reg['name']} v{latest_ver} for {reg['platform_key']}")
 
-    if server_bin.exists() and not args.force:
+    if server_bin.exists() and not getattr(args, "force", False):
         if current_ver == latest_ver:
             print(f"✓ Binary v{latest_ver} already present and up to date: {server_bin}")
             return 0
@@ -313,7 +314,6 @@ def cmd_install(args):
 
     if server_bin.exists():
         server_bin.chmod(0o755)
-        # Save version record
         record = {
             "name": reg["name"],
             "version": latest_ver,
@@ -384,7 +384,7 @@ def cmd_auth(args):
         return 1
 
     # Check existing auth
-    if not args.force and check_auth_status(server_bin):
+    if not getattr(args, "force", False) and check_auth_status(server_bin):
         print("✓ Already authenticated! Credentials are valid.")
         return 0
 
@@ -562,26 +562,38 @@ def cmd_auth(args):
     return 0 if authenticated else 1
 
 
-def cmd_config_paseo(args):
-    """Configures Paseo (~/.paseo/config.json) to use Antigravity ACP."""
-    if not PASEO_CONFIG.parent.exists():
-        PASEO_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+def cmd_run(args):
+    """Executes the ACP server directly on stdio (for use by any ACP client/editor)."""
+    server_bin = get_server_binary_path()
+    if not server_bin.exists():
+        print(f"Error: Binary not found at {server_bin}. Run 'install' first.", file=sys.stderr)
+        return 1
+
+    extra_args = getattr(args, "extra_args", [])
+    cmd = [str(server_bin.resolve())] + extra_args
+    os.execv(str(server_bin.resolve()), cmd)
+
+
+def cmd_paseo(args):
+    """Configures Paseo (~/.paseo/config.json) to register the Antigravity ACP provider."""
+    config_path = Path(getattr(args, "config_path", str(PASEO_CONFIG))).expanduser()
+    if not config_path.parent.exists():
+        config_path.parent.mkdir(parents=True, exist_ok=True)
 
     config_data = {}
-    if PASEO_CONFIG.exists():
+    if config_path.exists():
         try:
-            with open(PASEO_CONFIG, "r", encoding="utf-8") as f:
+            with open(config_path, "r", encoding="utf-8") as f:
                 config_data = json.load(f)
         except Exception as e:
-            print(f"Warning: Failed to parse existing {PASEO_CONFIG}: {e}", file=sys.stderr)
+            print(f"Warning: Failed to parse existing {config_path}: {e}", file=sys.stderr)
 
     # Backup original
-    if PASEO_CONFIG.exists():
-        backup_path = PASEO_CONFIG.with_suffix(".json.bak")
-        shutil.copy2(PASEO_CONFIG, backup_path)
+    if config_path.exists():
+        backup_path = config_path.with_suffix(".json.bak")
+        shutil.copy2(config_path, backup_path)
         print(f"Backed up existing config to {backup_path}")
 
-    # Ensure structure
     agents = config_data.setdefault("agents", {})
     providers = agents.setdefault("providers", {})
 
@@ -608,10 +620,10 @@ def cmd_config_paseo(args):
         },
     }
 
-    with open(PASEO_CONFIG, "w", encoding="utf-8") as f:
+    with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config_data, f, indent=2)
 
-    print(f"✓ Updated {PASEO_CONFIG} with antigravity provider configuration.")
+    print(f"✓ Updated {config_path} with antigravity provider configuration.")
 
     # Reload Paseo if running
     if shutil.which("paseo"):
@@ -666,40 +678,39 @@ def cmd_status(args):
     else:
         print("[Auth]       ? Skipped (binary missing)")
 
-    # 4. Paseo config check
+    # 4. Paseo status (optional client check)
+    print("-" * 65)
+    print("Client Integrations:")
     if PASEO_CONFIG.exists():
         try:
             with open(PASEO_CONFIG, "r", encoding="utf-8") as f:
                 c = json.load(f)
             ag = c.get("agents", {}).get("providers", {}).get("antigravity")
             if ag:
-                print(f"[Paseo Cfg]  ✓ Configured (command: {ag.get('command')})")
+                print(f" [Paseo Config] ✓ Configured (command: {ag.get('command')})")
             else:
-                print("[Paseo Cfg]  ✗ 'antigravity' provider not found in ~/.paseo/config.json")
+                print(" [Paseo Config] - Not configured in ~/.paseo/config.json (run './setup.sh paseo' to add)")
         except Exception:
-            print("[Paseo Cfg]  ✗ Error reading ~/.paseo/config.json")
+            print(" [Paseo Config] ✗ Error reading ~/.paseo/config.json")
     else:
-        print("[Paseo Cfg]  ✗ ~/.paseo/config.json does not exist")
+        print(" [Paseo Config] - ~/.paseo/config.json not found")
 
-    # 5. Paseo CLI check
     if shutil.which("paseo"):
         res = subprocess.run(["paseo", "provider", "ls"], capture_output=True, text=True)
         if res.returncode == 0 and "antigravity" in res.stdout:
             for line in res.stdout.splitlines():
                 if "antigravity" in line:
-                    print(f"[Paseo CLI]  ✓ {line.strip()}")
+                    print(f" [Paseo Status] ✓ {line.strip()}")
                     break
         else:
-            print("[Paseo CLI]  ✗ Antigravity provider not reported in 'paseo provider ls'")
-    else:
-        print("[Paseo CLI]  - paseo command not installed in PATH")
+            print(" [Paseo Status] - Antigravity provider not active in 'paseo provider ls'")
 
     print("=" * 65)
     return 0
 
 
 def cmd_setup(args):
-    """End-to-end setup: install from registry -> auth -> configure -> status."""
+    """End-to-end ACP setup: install from registry -> auth -> status."""
     print(">>> Step 1: Checking and fetching binary from ACP Registry...")
     ret = cmd_install(args)
     if ret != 0:
@@ -710,31 +721,29 @@ def cmd_setup(args):
     if ret != 0:
         return ret
 
-    print("\n>>> Step 3: Configuring Paseo...")
-    ret = cmd_config_paseo(args)
-    if ret != 0:
-        return ret
+    print("\n>>> Step 3: Verifying ACP server status...")
+    ret = cmd_status(args)
 
-    print("\n>>> Step 4: Verifying setup...")
-    return cmd_status(args)
+    print("\n💡 Antigravity ACP is ready for any ACP client (Zed, Cursor, OpenCode, Paseo, etc.)!")
+    print("To integrate with Paseo specifically, run:")
+    print("  ./setup.sh paseo\n")
+    return ret
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Google Antigravity ACP & Paseo Integration CLI (Powered by ACP Registry)",
+        description="Google Antigravity ACP Server Manager & Auth Helper (ACP Registry)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
-    # setup
-    p_setup = subparsers.add_parser("setup", help="Run full setup (install from registry, auth, config)")
+    # setup (general ACP setup: install + auth + status)
+    p_setup = subparsers.add_parser("setup", help="Run full ACP setup (install from registry, auth, verify)")
     p_setup.add_argument("--force", action="store_true", help="Force re-download and re-auth")
-    p_setup.add_argument("--use-registry-args", action="store_true", help="Include default arguments from registry (e.g. --uid=)")
-    p_setup.add_argument("--use-uid", action="store_true", help="Alias for --use-registry-args")
     p_setup.set_defaults(func=cmd_setup)
 
     # install
-    p_inst = subparsers.add_parser("install", help="Download agy_acp_server from ACP Registry")
+    p_inst = subparsers.add_parser("install", help="Download/update agy_acp_server from ACP Registry")
     p_inst.add_argument("--force", action="store_true", help="Force re-download even if already present")
     p_inst.set_defaults(func=cmd_install)
 
@@ -743,15 +752,28 @@ def main():
     p_auth.add_argument("--force", action="store_true", help="Force re-authentication")
     p_auth.set_defaults(func=cmd_auth)
 
-    # config
-    p_cfg = subparsers.add_parser("config", help="Update ~/.paseo/config.json with antigravity provider")
+    # status
+    p_stat = subparsers.add_parser("status", help="Check status of registry, binary, and authentication")
+    p_stat.set_defaults(func=cmd_status)
+
+    # run (serve ACP over stdio)
+    p_run = subparsers.add_parser("run", help="Run the Antigravity ACP server directly on stdio")
+    p_run.add_argument("extra_args", nargs=argparse.REMAINDER, help="Extra arguments passed to the server binary")
+    p_run.set_defaults(func=cmd_run)
+
+    # paseo (configure Paseo integration)
+    p_paseo = subparsers.add_parser("paseo", help="Configure Paseo (~/.paseo/config.json) to use Antigravity ACP")
+    p_paseo.add_argument("--use-registry-args", action="store_true", help="Include default arguments from registry (e.g. --uid=)")
+    p_paseo.add_argument("--use-uid", action="store_true", help="Alias for --use-registry-args")
+    p_paseo.add_argument("--config-path", default=str(PASEO_CONFIG), help="Path to Paseo config.json")
+    p_paseo.set_defaults(func=cmd_paseo)
+
+    # config alias for paseo
+    p_cfg = subparsers.add_parser("config", help="Alias for 'paseo' subcommand")
     p_cfg.add_argument("--use-registry-args", action="store_true", help="Include default arguments from registry (e.g. --uid=)")
     p_cfg.add_argument("--use-uid", action="store_true", help="Alias for --use-registry-args")
-    p_cfg.set_defaults(func=cmd_config_paseo)
-
-    # status
-    p_stat = subparsers.add_parser("status", help="Check status of registry, binary, auth, and Paseo")
-    p_stat.set_defaults(func=cmd_status)
+    p_cfg.add_argument("--config-path", default=str(PASEO_CONFIG), help="Path to Paseo config.json")
+    p_cfg.set_defaults(func=cmd_paseo)
 
     args = parser.parse_args()
     if not args.command:
