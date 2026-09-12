@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Antigravity ACP Helper CLI
-Automates downloading, headless JSON-RPC OAuth authentication,
-and Paseo integration for Google Antigravity ACP Server.
+Automates downloading latest releases from the ACP Registry,
+headless JSON-RPC OAuth authentication, and Paseo integration for Google Antigravity ACP Server.
 """
 
 import argparse
@@ -17,28 +17,63 @@ import sys
 import threading
 import time
 import urllib.request
-import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict, Optional
 from urllib.parse import urlparse
+import zipfile
 
-# Default paths
+# Base paths
 BASE_DIR = Path(__file__).resolve().parent
 BIN_DIR = BASE_DIR / "bin"
-SERVER_BIN = BASE_DIR / "agy_acp_server.par"
 AUTH_URL_FILE = BASE_DIR / "auth_url.txt"
 CALLBACK_URL_FILE = BASE_DIR / "callback_url.txt"
 STATUS_FILE = BASE_DIR / "auth_status.json"
 PASEO_CONFIG = Path.home() / ".paseo" / "config.json"
+REGISTRY_CACHE_FILE = BASE_DIR / ".registry_cache.json"
+VERSION_FILE = BASE_DIR / "version.json"
 
-# Official download URLs
-RELEASES = {
-    ("Linux", "x86_64"): "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-agy_acp_server_1.1.1-linux-x86_64.zip",
-    ("Linux", "aarch64"): "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-agy_acp_server_1.1.1-linux-arm64.zip",
-    ("Darwin", "arm64"): "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-agy_acp_server_1.1.1-darwin-arm64.zip",
+# Official ACP Registry
+REGISTRY_URL = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json"
+AGENT_ID = "antigravity-acp"
+
+# Fallback release if registry is unreachable offline
+FALLBACK_RELEASES = {
+    "linux-x86_64": {
+        "version": "1.1.1",
+        "archive": "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-agy_acp_server_1.1.1-linux-x86_64.zip",
+        "cmd": "./agy_acp_server.par",
+        "args": ["--uid="],
+    },
+    "linux-aarch64": {
+        "version": "1.1.1",
+        "archive": "https://dl.google.com/agy-extensions/releases/linux/agy-acp-server-agy_acp_server_1.1.1-linux-arm64.zip",
+        "cmd": "./agy_acp_server.par",
+        "args": ["--uid="],
+    },
+    "darwin-aarch64": {
+        "version": "1.1.1",
+        "archive": "https://dl.google.com/agy-extensions/releases/macos/agy-acp-server-agy_acp_server_1.1.1-darwin-arm64.zip",
+        "cmd": "./agy_acp_server.par",
+        "args": [],
+    },
+    "windows-x86_64": {
+        "version": "1.1.1",
+        "archive": "https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-agy_acp_server_1.1.1-windows-x86_64.zip",
+        "cmd": "./agy_acp_server.exe",
+        "args": [],
+    },
+    "windows-aarch64": {
+        "version": "1.1.1",
+        "archive": "https://dl.google.com/agy-extensions/releases/windows/agy-acp-server-agy_acp_server_1.1.1-windows-arm64.zip",
+        "cmd": "./agy_acp_server.exe",
+        "args": [],
+    },
 }
 
 
 def is_wsl() -> bool:
+    """Checks if running inside WSL2 environment."""
     if sys.platform != "linux":
         return False
     try:
@@ -47,6 +82,135 @@ def is_wsl() -> bool:
             return "microsoft" in content or "wsl" in content
     except Exception:
         return False
+
+
+def get_platform_key() -> str:
+    """
+    Returns platform key matching ACP Registry:
+    darwin-aarch64, linux-x86_64, linux-aarch64, windows-x86_64, windows-aarch64
+    """
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+
+    if system == "linux":
+        sys_str = "linux"
+    elif system == "darwin":
+        sys_str = "darwin"
+    elif system == "windows":
+        sys_str = "windows"
+    else:
+        sys_str = system
+
+    if machine in ("x86_64", "amd64", "x64"):
+        arch_str = "x86_64"
+    elif machine in ("aarch64", "arm64"):
+        arch_str = "aarch64"
+    else:
+        arch_str = machine
+
+    return f"{sys_str}-{arch_str}"
+
+
+def fetch_registry_info() -> Dict[str, Any]:
+    """
+    Fetches the latest release info for Antigravity ACP from the official registry.
+    Falls back to local cache or built-in metadata if network is unavailable.
+    """
+    data = None
+    platform_key = get_platform_key()
+
+    try:
+        req = urllib.request.Request(
+            REGISTRY_URL,
+            headers={"User-Agent": "antigravity-acp-helper/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.load(resp)
+
+        # Cache valid response
+        try:
+            with open(REGISTRY_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+    except Exception as e:
+        # Try local cache
+        if REGISTRY_CACHE_FILE.exists():
+            try:
+                with open(REGISTRY_CACHE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                pass
+
+    if not data:
+        # Fallback
+        fallback = FALLBACK_RELEASES.get(platform_key, FALLBACK_RELEASES["linux-x86_64"])
+        return {
+            "id": AGENT_ID,
+            "name": "Google Antigravity",
+            "version": fallback["version"],
+            "description": "Google’s AI coding agent",
+            "platform_key": platform_key,
+            "archive_url": fallback["archive"],
+            "cmd": fallback["cmd"],
+            "args": fallback.get("args", []),
+            "source": "fallback",
+        }
+
+    # Find agent
+    target_agent = None
+    for agent in data.get("agents", []):
+        if agent.get("id") in (AGENT_ID, "antigravity"):
+            target_agent = agent
+            break
+
+    if not target_agent:
+        raise ValueError(f"Agent '{AGENT_ID}' not found in registry!")
+
+    dist = target_agent.get("distribution", {}).get("binary", {}).get(platform_key)
+    if not dist:
+        raise ValueError(f"Platform '{platform_key}' not supported in registry for {AGENT_ID}")
+
+    return {
+        "id": target_agent.get("id", AGENT_ID),
+        "name": target_agent.get("name", "Google Antigravity"),
+        "version": target_agent.get("version", "1.0.0"),
+        "description": target_agent.get("description", ""),
+        "website": target_agent.get("website", ""),
+        "platform_key": platform_key,
+        "archive_url": dist["archive"],
+        "cmd": dist.get("cmd", "./agy_acp_server.par"),
+        "args": dist.get("args", []),
+        "source": "registry",
+    }
+
+
+def get_server_binary_path(registry_info: Optional[Dict[str, Any]] = None) -> Path:
+    """Returns absolute path to the local server executable."""
+    cmd = "./agy_acp_server.par"
+    if registry_info and "cmd" in registry_info:
+        cmd = registry_info["cmd"]
+    elif VERSION_FILE.exists():
+        try:
+            with open(VERSION_FILE, "r", encoding="utf-8") as f:
+                info = json.load(f)
+                cmd = info.get("cmd", cmd)
+        except Exception:
+            pass
+
+    bin_name = Path(cmd).name
+    return BASE_DIR / bin_name
+
+
+def get_installed_version_info() -> Optional[Dict[str, Any]]:
+    """Reads installed version information if available."""
+    if VERSION_FILE.exists():
+        try:
+            with open(VERSION_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
 
 
 def setup_xdg_open_wrapper():
@@ -103,46 +267,81 @@ def open_in_browser(url: str):
 
 
 def cmd_install(args):
-    """Downloads and extracts agy_acp_server if not present."""
-    if SERVER_BIN.exists() and not args.force:
-        print(f"✓ Binary already present: {SERVER_BIN}")
-        return 0
-
-    os_type = platform.system()
-    arch = platform.machine()
-    key = (os_type, arch)
-
-    url = RELEASES.get(key)
-    if not url:
-        print(f"Error: Unsupported OS/architecture: {os_type} {arch}", file=sys.stderr)
-        print("Please manually place 'agy_acp_server.par' in the repository directory.", file=sys.stderr)
+    """Downloads and extracts agy_acp_server using the official ACP registry."""
+    print(f"Fetching latest release info from ACP registry ({REGISTRY_URL})...")
+    try:
+        reg = fetch_registry_info()
+    except Exception as e:
+        print(f"Error fetching registry: {e}", file=sys.stderr)
         return 1
 
+    server_bin = get_server_binary_path(reg)
+    installed_info = get_installed_version_info()
+    current_ver = installed_info.get("version") if installed_info else None
+    latest_ver = reg["version"]
+
+    print(f"Registry: {reg['name']} v{latest_ver} for {reg['platform_key']}")
+
+    if server_bin.exists() and not args.force:
+        if current_ver == latest_ver:
+            print(f"✓ Binary v{latest_ver} already present and up to date: {server_bin}")
+            return 0
+        elif current_ver:
+            print(f"Update available: v{current_ver} -> v{latest_ver}")
+        else:
+            print(f"✓ Binary already present at {server_bin} (use --force to reinstall)")
+            return 0
+
+    url = reg["archive_url"]
     zip_name = Path(url).name
     zip_path = BASE_DIR / zip_name
 
-    print(f"Downloading {zip_name} from Google CDN...")
-    urllib.request.urlretrieve(url, zip_path)
-    print("Extracting archive...")
-    with zipfile.ZipFile(zip_path, "r") as z:
-        z.extractall(BASE_DIR)
+    print(f"Downloading {zip_name}...")
+    try:
+        urllib.request.urlretrieve(url, zip_path)
+    except Exception as e:
+        print(f"Download failed: {e}", file=sys.stderr)
+        return 1
 
-    if SERVER_BIN.exists():
-        SERVER_BIN.chmod(0o755)
-        print(f"✓ agy_acp_server ready at {SERVER_BIN}")
+    print("Extracting archive...")
+    try:
+        with zipfile.ZipFile(zip_path, "r") as z:
+            z.extractall(BASE_DIR)
+    except Exception as e:
+        print(f"Extraction failed: {e}", file=sys.stderr)
+        return 1
+
+    if server_bin.exists():
+        server_bin.chmod(0o755)
+        # Save version record
+        record = {
+            "name": reg["name"],
+            "version": latest_ver,
+            "platform": reg["platform_key"],
+            "archive_url": url,
+            "cmd": reg["cmd"],
+            "args": reg.get("args", []),
+            "installed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with open(VERSION_FILE, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2)
+
+        print(f"✓ {reg['name']} v{latest_ver} successfully installed at {server_bin}")
         return 0
     else:
-        print("Error: agy_acp_server.par was not found in archive!", file=sys.stderr)
+        print(f"Error: Executable {server_bin.name} not found after extraction!", file=sys.stderr)
         return 1
 
 
-def check_auth_status() -> bool:
+def check_auth_status(server_bin: Optional[Path] = None) -> bool:
     """Checks if agy_acp_server is already authenticated."""
-    if not SERVER_BIN.exists():
+    if not server_bin:
+        server_bin = get_server_binary_path()
+    if not server_bin.exists():
         return False
 
     proc = subprocess.Popen(
-        [str(SERVER_BIN)],
+        [str(server_bin)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -179,12 +378,13 @@ def check_auth_status() -> bool:
 
 def cmd_auth(args):
     """Performs JSON-RPC stdio authentication."""
-    if not SERVER_BIN.exists():
-        print(f"Error: Server binary not found at {SERVER_BIN}. Run 'install' first.", file=sys.stderr)
+    server_bin = get_server_binary_path()
+    if not server_bin.exists():
+        print(f"Error: Server binary not found at {server_bin}. Run 'install' first.", file=sys.stderr)
         return 1
 
     # Check existing auth
-    if not args.force and check_auth_status():
+    if not args.force and check_auth_status(server_bin):
         print("✓ Already authenticated! Credentials are valid.")
         return 0
 
@@ -200,9 +400,9 @@ def cmd_auth(args):
         if p.exists():
             p.unlink()
 
-    print(f"Starting {SERVER_BIN.name}...")
+    print(f"Starting {server_bin.name}...")
     proc = subprocess.Popen(
-        [str(SERVER_BIN)],
+        [str(server_bin)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -385,9 +585,19 @@ def cmd_config_paseo(args):
     agents = config_data.setdefault("agents", {})
     providers = agents.setdefault("providers", {})
 
-    cmd = [str(SERVER_BIN.resolve())]
-    if args.use_uid:
-        cmd.append("--uid=")
+    server_bin = get_server_binary_path()
+    cmd = [str(server_bin.resolve())]
+
+    # Check registry or args for extra flags
+    if getattr(args, "use_registry_args", False) or getattr(args, "use_uid", False):
+        try:
+            reg = fetch_registry_info()
+            for extra_arg in reg.get("args", []):
+                if extra_arg not in cmd:
+                    cmd.append(extra_arg)
+        except Exception:
+            if "--uid=" not in cmd:
+                cmd.append("--uid=")
 
     providers["antigravity"] = {
         "extends": "acp",
@@ -409,7 +619,6 @@ def cmd_config_paseo(args):
         res = subprocess.run(["paseo", "reload"], capture_output=True, text=True)
         if res.returncode == 0:
             print("✓ Paseo daemon reloaded.")
-            # Give daemon a second to initialize ACP agent
             time.sleep(2)
             subprocess.run(["paseo", "provider", "ls"])
         else:
@@ -421,63 +630,77 @@ def cmd_config_paseo(args):
 
 
 def cmd_status(args):
-    """Displays health and status of binary, auth, and Paseo."""
-    print("=" * 60)
+    """Displays health and status of binary, registry, auth, and Paseo."""
+    print("=" * 65)
     print("ANTIGRAVITY ACP STATUS CHECK")
-    print("=" * 60)
+    print("=" * 65)
 
-    # 1. Binary check
-    if SERVER_BIN.exists():
-        size_mb = SERVER_BIN.stat().st_size / (1024 * 1024)
-        print(f"[Binary]    ✓ Present ({SERVER_BIN.resolve()}) - {size_mb:.1f} MB")
+    # 1. Registry check
+    try:
+        reg = fetch_registry_info()
+        print(f"[Registry]   ✓ Latest {reg['name']} v{reg['version']} ({reg['platform_key']})")
+    except Exception as e:
+        print(f"[Registry]   ! Unable to reach registry: {e}")
+        reg = None
+
+    # 2. Binary check
+    server_bin = get_server_binary_path(reg)
+    installed_info = get_installed_version_info()
+    inst_ver = installed_info.get("version") if installed_info else "unknown"
+
+    if server_bin.exists():
+        size_mb = server_bin.stat().st_size / (1024 * 1024)
+        print(f"[Binary]     ✓ Present ({server_bin.name}, version: {inst_ver}) - {size_mb:.1f} MB")
+        if reg and inst_ver != "unknown" and inst_ver != reg["version"]:
+            print(f"[Update]     ! Newer version v{reg['version']} available! Run './setup.sh install --force'")
     else:
-        print(f"[Binary]    ✗ Missing at {SERVER_BIN}")
+        print(f"[Binary]     ✗ Missing at {server_bin}")
 
-    # 2. Auth check
-    if SERVER_BIN.exists():
-        is_auth = check_auth_status()
+    # 3. Auth check
+    if server_bin.exists():
+        is_auth = check_auth_status(server_bin)
         if is_auth:
-            print("[Auth]      ✓ Authenticated (OAuth token valid)")
+            print("[Auth]       ✓ Authenticated (OAuth token valid)")
         else:
-            print("[Auth]      ✗ Not authenticated (Run 'auth' command)")
+            print("[Auth]       ✗ Not authenticated (Run './setup.sh auth')")
     else:
-        print("[Auth]      ? Skipped (binary missing)")
+        print("[Auth]       ? Skipped (binary missing)")
 
-    # 3. Paseo config check
+    # 4. Paseo config check
     if PASEO_CONFIG.exists():
         try:
             with open(PASEO_CONFIG, "r", encoding="utf-8") as f:
                 c = json.load(f)
             ag = c.get("agents", {}).get("providers", {}).get("antigravity")
             if ag:
-                print(f"[Paseo Cfg] ✓ Configured (command: {ag.get('command')})")
+                print(f"[Paseo Cfg]  ✓ Configured (command: {ag.get('command')})")
             else:
-                print("[Paseo Cfg] ✗ 'antigravity' provider not found in ~/.paseo/config.json")
+                print("[Paseo Cfg]  ✗ 'antigravity' provider not found in ~/.paseo/config.json")
         except Exception:
-            print("[Paseo Cfg] ✗ Error reading ~/.paseo/config.json")
+            print("[Paseo Cfg]  ✗ Error reading ~/.paseo/config.json")
     else:
-        print("[Paseo Cfg] ✗ ~/.paseo/config.json does not exist")
+        print("[Paseo Cfg]  ✗ ~/.paseo/config.json does not exist")
 
-    # 4. Paseo CLI check
+    # 5. Paseo CLI check
     if shutil.which("paseo"):
         res = subprocess.run(["paseo", "provider", "ls"], capture_output=True, text=True)
         if res.returncode == 0 and "antigravity" in res.stdout:
             for line in res.stdout.splitlines():
                 if "antigravity" in line:
-                    print(f"[Paseo CLI] ✓ {line.strip()}")
+                    print(f"[Paseo CLI]  ✓ {line.strip()}")
                     break
         else:
-            print("[Paseo CLI] ✗ Antigravity provider not reported in 'paseo provider ls'")
+            print("[Paseo CLI]  ✗ Antigravity provider not reported in 'paseo provider ls'")
     else:
-        print("[Paseo CLI] - paseo command not installed in PATH")
+        print("[Paseo CLI]  - paseo command not installed in PATH")
 
-    print("=" * 60)
+    print("=" * 65)
     return 0
 
 
 def cmd_setup(args):
-    """End-to-end setup: install -> auth -> configure -> status."""
-    print(">>> Step 1: Checking binary...")
+    """End-to-end setup: install from registry -> auth -> configure -> status."""
+    print(">>> Step 1: Checking and fetching binary from ACP Registry...")
     ret = cmd_install(args)
     if ret != 0:
         return ret
@@ -498,20 +721,21 @@ def cmd_setup(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Google Antigravity ACP & Paseo Integration CLI",
+        description="Google Antigravity ACP & Paseo Integration CLI (Powered by ACP Registry)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
     # setup
-    p_setup = subparsers.add_parser("setup", help="Run full setup (install, auth, config)")
+    p_setup = subparsers.add_parser("setup", help="Run full setup (install from registry, auth, config)")
     p_setup.add_argument("--force", action="store_true", help="Force re-download and re-auth")
-    p_setup.add_argument("--use-uid", action="store_true", help="Add --uid= argument to command in Paseo config")
+    p_setup.add_argument("--use-registry-args", action="store_true", help="Include default arguments from registry (e.g. --uid=)")
+    p_setup.add_argument("--use-uid", action="store_true", help="Alias for --use-registry-args")
     p_setup.set_defaults(func=cmd_setup)
 
     # install
-    p_inst = subparsers.add_parser("install", help="Download agy_acp_server if missing")
-    p_inst.add_argument("--force", action="store_true", help="Force re-download")
+    p_inst = subparsers.add_parser("install", help="Download agy_acp_server from ACP Registry")
+    p_inst.add_argument("--force", action="store_true", help="Force re-download even if already present")
     p_inst.set_defaults(func=cmd_install)
 
     # auth
@@ -521,11 +745,12 @@ def main():
 
     # config
     p_cfg = subparsers.add_parser("config", help="Update ~/.paseo/config.json with antigravity provider")
-    p_cfg.add_argument("--use-uid", action="store_true", help="Add --uid= argument to command")
+    p_cfg.add_argument("--use-registry-args", action="store_true", help="Include default arguments from registry (e.g. --uid=)")
+    p_cfg.add_argument("--use-uid", action="store_true", help="Alias for --use-registry-args")
     p_cfg.set_defaults(func=cmd_config_paseo)
 
     # status
-    p_stat = subparsers.add_parser("status", help="Check status of binary, auth, and Paseo")
+    p_stat = subparsers.add_parser("status", help="Check status of registry, binary, auth, and Paseo")
     p_stat.set_defaults(func=cmd_status)
 
     args = parser.parse_args()

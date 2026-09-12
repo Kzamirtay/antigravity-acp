@@ -13,10 +13,10 @@ cd ~/.local/share/antigravity-acp
 ```
 
 Команда `./setup.sh` выполнит полный цикл в интерактивном режиме:
-1. **Проверка/загрузка** бинарника `agy_acp_server.par` с официального CDN Google (если отсутствует).
-2. **Аутентификация** через протокол ACP (JSON-RPC stdio) с авто-открытием браузера.
+1. **Проверка/загрузка** актуального бинарника `agy_acp_server` напрямую из [официального ACP Registry](https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json) под вашу платформу (Linux x86_64/ARM64, macOS, Windows).
+2. **Аутентификация** через протокол ACP (JSON-RPC stdio) с авто-открытием браузера (поддерживает WSL2, Linux, macOS и ручной headless/SSH ввод).
 3. **Настройка Paseo** (`~/.paseo/config.json`) и перезагрузка демона.
-4. **Проверка статуса** доступности агента в `paseo provider ls`.
+4. **Проверка статуса** доступности агента в `paseo provider ls` и проверка обновлений в реестре.
 
 ---
 
@@ -64,11 +64,11 @@ sequenceDiagram
 
 | Команда | Описание |
 |---|---|
-| `./setup.sh` или `./agy_acp.py setup` | Полный цикл настройки (скачивание + логин + конфиг + проверка) |
-| `./setup.sh status` | Проверка наличия бинарника, валидности OAuth-токена и статуса в Paseo |
+| `./setup.sh` или `./agy_acp.py setup` | Полный цикл: скачивание из реестра + логин + конфиг + проверка |
+| `./setup.sh status` | Проверка реестра, наличия обновлений, валидности токенов и статуса Paseo |
+| `./setup.sh install [--force]` | Скачивание и установка актуального релиза из официального ACP Registry |
 | `./setup.sh auth [--force]` | Запуск только процесса OAuth-авторизации |
-| `./setup.sh config [--use-uid]` | Запись настроек провайдера в `~/.paseo/config.json` и `paseo reload` |
-| `./setup.sh install [--force]` | Скачивание и распаковка `agy_acp_server.par` |
+| `./setup.sh config [--use-registry-args]` | Запись настроек в `~/.paseo/config.json` (с флагами из реестра) и `paseo reload` |
 
 ---
 

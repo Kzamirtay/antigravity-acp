@@ -8,6 +8,8 @@ auth_url.txt
 callback_url.txt
 auth_status.json
 *.log
+.registry_cache.json
+version.json
 
 # Python cache
 __pycache__/
