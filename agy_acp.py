@@ -317,6 +317,14 @@ for arg in "$@"; do
 done
 exit 0
 """
+    if wrapper_path.exists():
+        try:
+            if wrapper_path.read_text(encoding="utf-8") == script_content:
+                wrapper_path.chmod(0o755)
+                return wrapper_path
+        except Exception:
+            pass
+
     with open(wrapper_path, "w", encoding="utf-8") as f:
         f.write(script_content)
     wrapper_path.chmod(0o755)
