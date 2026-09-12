@@ -11,7 +11,6 @@ import json
 import os
 import platform
 import re
-import select
 import shutil
 import subprocess
 import sys
@@ -128,14 +127,12 @@ def fetch_registry_info() -> Dict[str, Any]:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.load(resp)
 
-        # Cache valid response
         try:
             with open(REGISTRY_CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
         except Exception:
             pass
     except Exception:
-        # Try local cache
         if REGISTRY_CACHE_FILE.exists():
             try:
                 with open(REGISTRY_CACHE_FILE, "r", encoding="utf-8") as f:
@@ -144,7 +141,6 @@ def fetch_registry_info() -> Dict[str, Any]:
                 pass
 
     if not data:
-        # Fallback
         fallback = FALLBACK_RELEASES.get(platform_key, FALLBACK_RELEASES["linux-x86_64"])
         return {
             "id": AGENT_ID,
@@ -158,7 +154,6 @@ def fetch_registry_info() -> Dict[str, Any]:
             "source": "fallback",
         }
 
-    # Find agent
     target_agent = None
     for agent in data.get("agents", []):
         if agent.get("id") in (AGENT_ID, "antigravity"):
@@ -247,22 +242,14 @@ def get_installed_version_info() -> Optional[Dict[str, Any]]:
 
 
 def setup_xdg_open_wrapper():
-    """Sets up bin/xdg-open interceptor for capturing auth URLs."""
+    """Sets up bin/xdg-open interceptor that non-blockingly captures the URL."""
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     wrapper_path = BIN_DIR / "xdg-open"
 
-    wsl_mode = is_wsl()
-    open_cmd = (
-        'powershell.exe -NoProfile -Command "Start-Process \'$URL\'" < /dev/null > /dev/null 2>&1 &'
-        if wsl_mode
-        else 'python3 -m webbrowser "$URL" > /dev/null 2>&1 &'
-    )
-
-    script_content = f"""#!/bin/bash
-URL="$1"
-echo "$URL" > "{AUTH_URL_FILE}"
-echo "[xdg-open] Intercepted URL: $URL" >&2
-{open_cmd}
+    # Fast wrapper: saves URL and exits immediately so server is never blocked
+    script_content = f"""#!/bin/sh
+echo "$1" > "{AUTH_URL_FILE}"
+exit 0
 """
     with open(wrapper_path, "w", encoding="utf-8") as f:
         f.write(script_content)
@@ -274,12 +261,11 @@ def open_in_browser(url: str):
     """Attempts to open URL across OS environments (WSL, Linux, macOS)."""
     if is_wsl():
         try:
-            subprocess.run(
+            subprocess.Popen(
                 ["powershell.exe", "-NoProfile", "-Command", f'Start-Process "{url}"'],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=5,
             )
             return True
         except Exception:
@@ -287,7 +273,7 @@ def open_in_browser(url: str):
 
     if sys.platform == "darwin":
         try:
-            subprocess.run(["open", url], timeout=5)
+            subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return True
         except Exception:
             pass
@@ -318,7 +304,6 @@ def cmd_install(args):
     if server_bin.exists() and not getattr(args, "force", False):
         if current_ver == latest_ver:
             print(f"✓ Binary v{latest_ver} already present and up to date: {server_bin}")
-            # Ensure permissions are intact
             server_bin.chmod(0o755)
             return 0
         elif current_ver:
@@ -344,7 +329,6 @@ def cmd_install(args):
         with zipfile.ZipFile(zip_path, "r") as z:
             for info in z.infolist():
                 extracted_path = z.extract(info, BASE_DIR)
-                # Preserve permissions from zip metadata
                 perm = (info.external_attr >> 16) & 0o777
                 if perm:
                     os.chmod(extracted_path, perm | 0o755 if (perm & 0o111) else perm)
@@ -384,7 +368,7 @@ def cmd_install(args):
 
 
 def check_auth_status(server_bin: Optional[Path] = None) -> bool:
-    """Checks if agy_acp_server is already authenticated."""
+    """Checks if agy_acp_server is already authenticated using non-blocking stream threads."""
     if not server_bin:
         server_bin = get_server_binary_path()
     if not server_bin.exists():
@@ -403,29 +387,54 @@ def check_auth_status(server_bin: Optional[Path] = None) -> bool:
     except Exception:
         return False
 
+    stdout_queue: List[str] = []
+    stderr_queue: List[str] = []
+
+    def stream_reader(stream, queue):
+        for line in iter(stream.readline, ""):
+            queue.append(line)
+
+    t_out = threading.Thread(target=stream_reader, args=(proc.stdout, stdout_queue), daemon=True)
+    t_err = threading.Thread(target=stream_reader, args=(proc.stderr, stderr_queue), daemon=True)
+    t_out.start()
+    t_err.start()
+
     try:
         # initialize
         proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1}}) + "\n")
         proc.stdin.flush()
 
-        r, _, _ = select.select([proc.stdout], [], [], 3)
-        if not r:
-            return False
-        init_line = proc.stdout.readline()
-        if not init_line:
+        start = time.time()
+        while time.time() - start < 4:
+            if stdout_queue:
+                break
+            time.sleep(0.05)
+
+        if not stdout_queue:
             return False
 
         # authenticate
         proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "authenticate", "params": {"methodId": "oauth-personal"}}) + "\n")
         proc.stdin.flush()
 
-        r, _, _ = select.select([proc.stdout, proc.stderr], [], [], 3)
-        if proc.stdout in r:
-            line = proc.stdout.readline()
-            if line:
-                data = json.loads(line)
-                if "result" in data and not data.get("error"):
-                    return True
+        start = time.time()
+        while time.time() - start < 4:
+            # Check for id: 2 result
+            for line in stdout_queue:
+                if '"id":2' in line or '"id": 2' in line:
+                    try:
+                        d = json.loads(line)
+                        if "result" in d and not d.get("error"):
+                            return True
+                    except json.JSONDecodeError:
+                        pass
+            if stderr_queue:
+                # If server printed auth prompt, it is NOT authenticated
+                for err_line in stderr_queue:
+                    if "accounts.google.com" in err_line or "Open the following link" in err_line:
+                        return False
+            time.sleep(0.05)
+
         return False
     except Exception:
         return False
@@ -441,13 +450,12 @@ def check_auth_status(server_bin: Optional[Path] = None) -> bool:
 
 
 def cmd_auth(args):
-    """Performs JSON-RPC stdio authentication."""
+    """Performs JSON-RPC stdio authentication with robust threaded stream capture."""
     server_bin = get_server_binary_path()
     if not server_bin.exists():
         print(f"Error: Server binary not found at {server_bin}. Run 'install' first.", file=sys.stderr)
         return 1
 
-    # Ensure executable permissions
     try:
         server_bin.chmod(0o755)
     except Exception:
@@ -488,6 +496,18 @@ def cmd_auth(args):
         print(f"Error launching server process: {e}", file=sys.stderr)
         return 1
 
+    stdout_queue: List[str] = []
+    stderr_queue: List[str] = []
+
+    def stream_reader(stream, queue):
+        for line in iter(stream.readline, ""):
+            queue.append(line)
+
+    t_out = threading.Thread(target=stream_reader, args=(proc.stdout, stdout_queue), daemon=True)
+    t_err = threading.Thread(target=stream_reader, args=(proc.stderr, stderr_queue), daemon=True)
+    t_out.start()
+    t_err.start()
+
     # 1. Initialize
     print("1. Sending JSON-RPC 'initialize'...")
     init_req = {
@@ -506,28 +526,31 @@ def cmd_auth(args):
     except (BrokenPipeError, OSError) as e:
         time.sleep(0.3)
         proc.poll()
-        err_out = proc.stderr.read() if proc.stderr else ""
+        err_out = "".join(stderr_queue)
         print(f"\n❌ Failed to write to server (exit code: {proc.returncode}): {e}", file=sys.stderr)
         if err_out.strip():
             print(f"Server stderr:\n{err_out.strip()}", file=sys.stderr)
         return 1
 
-    # Read initialize response with timeout
-    init_line = None
+    # Wait for initialize response
     start_init = time.time()
-    while time.time() - start_init < 10:
+    init_data = None
+    while time.time() - start_init < 8:
         if proc.poll() is not None:
             break
-        r, _, _ = select.select([proc.stdout], [], [], 0.5)
-        if r:
-            init_line = proc.stdout.readline()
-            break
+        if stdout_queue:
+            try:
+                init_data = json.loads(stdout_queue[0])
+                break
+            except json.JSONDecodeError:
+                pass
+        time.sleep(0.05)
 
-    if not init_line:
+    if not init_data:
         time.sleep(0.2)
         proc.poll()
-        err_out = proc.stderr.read() if proc.stderr else ""
-        print(f"\n❌ Server terminated unexpectedly during initialize (exit code: {proc.returncode})", file=sys.stderr)
+        err_out = "".join(stderr_queue)
+        print(f"\n❌ Server did not respond to 'initialize' (exit code: {proc.returncode})", file=sys.stderr)
         if err_out.strip():
             print(f"Server stderr:\n{err_out.strip()}", file=sys.stderr)
         try:
@@ -536,14 +559,8 @@ def cmd_auth(args):
             pass
         return 1
 
-    try:
-        init_data = json.loads(init_line)
-        if "error" in init_data:
-            print(f"\n❌ JSON-RPC initialize error: {init_data['error']}", file=sys.stderr)
-            proc.terminate()
-            return 1
-    except json.JSONDecodeError:
-        print(f"\n❌ Non-JSON response from server: {init_line.strip()}", file=sys.stderr)
+    if "error" in init_data:
+        print(f"\n❌ JSON-RPC initialize error: {init_data['error']}", file=sys.stderr)
         proc.terminate()
         return 1
 
@@ -562,33 +579,51 @@ def cmd_auth(args):
     except (BrokenPipeError, OSError) as e:
         time.sleep(0.3)
         proc.poll()
-        err_out = proc.stderr.read() if proc.stderr else ""
+        err_out = "".join(stderr_queue)
         print(f"\n❌ Server pipe broken before authentication (exit code: {proc.returncode}): {e}", file=sys.stderr)
         if err_out.strip():
             print(f"Server stderr:\n{err_out.strip()}", file=sys.stderr)
         return 1
 
-    # 3. Intercept auth URL
+    # 3. Check for immediate success (already authenticated) OR intercept auth URL
     auth_url = None
     listener_port = None
     start_wait = time.time()
+    authenticated = False
 
     while time.time() - start_wait < 15:
         if proc.poll() is not None:
             break
 
-        r, _, _ = select.select([proc.stderr], [], [], 0.5)
-        if r:
-            line = proc.stderr.readline()
-            if line:
-                m = re.search(r"https://accounts\.google\.com/\S+", line)
-                if m:
-                    auth_url = m.group(0)
-                    port_m = re.search(r"redirect_uri=http%3A%2F%2F127\.0\.0\.1%3A(\d+)%2F", auth_url)
-                    if port_m:
-                        listener_port = int(port_m.group(1))
-                    break
+        # Check if stdout already received the success response!
+        for line in stdout_queue:
+            if '"id":2' in line or '"id": 2' in line:
+                try:
+                    resp = json.loads(line)
+                    if "result" in resp:
+                        print("\n🎉 Already authenticated! Credentials are valid.")
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                        return 0
+                except json.JSONDecodeError:
+                    pass
 
+        # Check stderr lines for auth URL
+        for line in stderr_queue:
+            m = re.search(r"https://accounts\.google\.com/\S+", line)
+            if m:
+                auth_url = m.group(0)
+                port_m = re.search(r"redirect_uri=http%3A%2F%2F127\.0\.0\.1%3A(\d+)%2F", auth_url)
+                if port_m:
+                    listener_port = int(port_m.group(1))
+                break
+
+        if auth_url:
+            break
+
+        # Check AUTH_URL_FILE written by xdg-open wrapper
         if AUTH_URL_FILE.exists():
             content = AUTH_URL_FILE.read_text(encoding="utf-8").strip()
             if content:
@@ -598,11 +633,25 @@ def cmd_auth(args):
                     listener_port = int(port_m.group(1))
                 break
 
+        time.sleep(0.1)
+
     if not auth_url:
+        # Check if stdout has completed
+        for line in stdout_queue:
+            if '"id":2' in line or '"id": 2' in line:
+                try:
+                    resp = json.loads(line)
+                    if "result" in resp:
+                        print("\n🎉 Already authenticated! Credentials are valid.")
+                        proc.terminate()
+                        return 0
+                except json.JSONDecodeError:
+                    pass
+
         time.sleep(0.2)
         proc.poll()
-        err_out = proc.stderr.read() if proc.stderr else ""
-        print(f"Error: Could not retrieve authentication URL from server (exit code: {proc.returncode}).", file=sys.stderr)
+        err_out = "".join(stderr_queue)
+        print(f"\n❌ Error: Could not retrieve authentication URL from server (exit code: {proc.returncode}).", file=sys.stderr)
         if err_out.strip():
             print(f"Server stderr:\n{err_out.strip()}", file=sys.stderr)
         try:
@@ -629,7 +678,6 @@ def cmd_auth(args):
     # Attempt to open browser
     open_in_browser(auth_url)
 
-    authenticated = False
     stop_event = threading.Event()
 
     def input_thread():
@@ -637,20 +685,18 @@ def cmd_auth(args):
         while not stop_event.is_set():
             if sys.stdin.isatty():
                 try:
-                    r, _, _ = select.select([sys.stdin], [], [], 0.5)
-                    if r:
-                        line = sys.stdin.readline()
-                        if line:
-                            cleaned = line.strip().strip("'\"")
-                            if cleaned and ("code" in cleaned or "http" in cleaned or "127.0.0.1" in cleaned or "localhost" in cleaned):
-                                CALLBACK_URL_FILE.write_text(cleaned, encoding="utf-8")
+                    line = sys.stdin.readline()
+                    if line:
+                        cleaned = line.strip().strip("'\"")
+                        if cleaned and ("code" in cleaned or "http" in cleaned or "127.0.0.1" in cleaned or "localhost" in cleaned):
+                            CALLBACK_URL_FILE.write_text(cleaned, encoding="utf-8")
                 except Exception:
                     pass
             else:
                 time.sleep(0.5)
 
-    t = threading.Thread(target=input_thread, daemon=True)
-    t.start()
+    t_in = threading.Thread(target=input_thread, daemon=True)
+    t_in.start()
 
     delivered_callback = False
     start_time = time.time()
@@ -659,29 +705,29 @@ def cmd_auth(args):
     try:
         while time.time() - start_time < timeout:
             if proc.poll() is not None:
-                err_out = proc.stderr.read() if proc.stderr else ""
+                err_out = "".join(stderr_queue)
                 print(f"Server process terminated unexpectedly with code {proc.returncode}")
                 if err_out.strip():
                     print(f"Server output:\n{err_out.strip()}", file=sys.stderr)
                 break
 
             # Check stdout for success response
-            r, _, _ = select.select([proc.stdout], [], [], 0.5)
-            if r:
-                line = proc.stdout.readline()
-                if line:
+            for line in stdout_queue:
+                if '"id":2' in line or '"id": 2' in line:
                     try:
                         resp = json.loads(line)
-                        if resp.get("id") == 2:
-                            if "result" in resp:
-                                print("\n🎉 Авторизация успешно завершена! (Authentication successful)")
-                                authenticated = True
-                                break
-                            elif "error" in resp:
-                                print(f"\n❌ Ошибка авторизации: {resp['error']}")
-                                break
+                        if "result" in resp:
+                            print("\n🎉 Авторизация успешно завершена! (Authentication successful)")
+                            authenticated = True
+                            break
+                        elif "error" in resp:
+                            print(f"\n❌ Ошибка авторизации: {resp['error']}")
+                            break
                     except json.JSONDecodeError:
                         pass
+
+            if authenticated:
+                break
 
             # Check callback file
             if not delivered_callback and CALLBACK_URL_FILE.exists():
@@ -710,10 +756,10 @@ def cmd_auth(args):
                     except Exception as e:
                         print(f"Попытка доставки коллбека: {e}")
 
-            time.sleep(0.5)
+            time.sleep(0.2)
     finally:
         stop_event.set()
-        time.sleep(1)
+        time.sleep(0.5)
         try:
             proc.terminate()
             proc.wait(timeout=2)
