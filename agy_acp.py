@@ -203,6 +203,38 @@ def get_server_binary_path(registry_info: Optional[Dict[str, Any]] = None) -> Pa
     return BASE_DIR / bin_name
 
 
+def get_server_command(server_bin: Optional[Path] = None, registry_info: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Builds the execution command line including required arguments from registry (e.g. --uid=)."""
+    if not server_bin:
+        server_bin = get_server_binary_path(registry_info)
+
+    cmd = [str(server_bin.resolve())]
+
+    args_to_add = []
+    if registry_info and "args" in registry_info:
+        args_to_add = registry_info["args"]
+    elif VERSION_FILE.exists():
+        try:
+            with open(VERSION_FILE, "r", encoding="utf-8") as f:
+                info = json.load(f)
+                args_to_add = info.get("args", [])
+        except Exception:
+            pass
+
+    if not args_to_add:
+        try:
+            reg = fetch_registry_info()
+            args_to_add = reg.get("args", [])
+        except Exception:
+            pass
+
+    for a in args_to_add:
+        if a not in cmd:
+            cmd.append(a)
+
+    return cmd
+
+
 def get_installed_version_info() -> Optional[Dict[str, Any]]:
     """Reads installed version information if available."""
     if VERSION_FILE.exists():
@@ -286,11 +318,14 @@ def cmd_install(args):
     if server_bin.exists() and not getattr(args, "force", False):
         if current_ver == latest_ver:
             print(f"✓ Binary v{latest_ver} already present and up to date: {server_bin}")
+            # Ensure permissions are intact
+            server_bin.chmod(0o755)
             return 0
         elif current_ver:
             print(f"Update available: v{current_ver} -> v{latest_ver}")
         else:
             print(f"✓ Binary already present at {server_bin} (use --force to reinstall)")
+            server_bin.chmod(0o755)
             return 0
 
     url = reg["archive_url"]
@@ -307,10 +342,25 @@ def cmd_install(args):
     print("Extracting archive...")
     try:
         with zipfile.ZipFile(zip_path, "r") as z:
-            z.extractall(BASE_DIR)
+            for info in z.infolist():
+                extracted_path = z.extract(info, BASE_DIR)
+                # Preserve permissions from zip metadata
+                perm = (info.external_attr >> 16) & 0o777
+                if perm:
+                    os.chmod(extracted_path, perm | 0o755 if (perm & 0o111) else perm)
+                elif Path(extracted_path).suffix in (".par", ".sh") or "localharness" in info.filename:
+                    os.chmod(extracted_path, 0o755)
     except Exception as e:
         print(f"Extraction failed: {e}", file=sys.stderr)
         return 1
+
+    # Ensure all extracted executables have +x permissions
+    for item in BASE_DIR.iterdir():
+        if item.is_file() and (item.suffix in (".par", ".sh", ".exe") or "localharness" in item.name):
+            try:
+                item.chmod(0o755)
+            except Exception:
+                pass
 
     if server_bin.exists():
         server_bin.chmod(0o755)
@@ -340,20 +390,30 @@ def check_auth_status(server_bin: Optional[Path] = None) -> bool:
     if not server_bin.exists():
         return False
 
-    proc = subprocess.Popen(
-        [str(server_bin)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
+    server_cmd = get_server_command(server_bin)
+    try:
+        proc = subprocess.Popen(
+            server_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except Exception:
+        return False
 
     try:
         # initialize
         proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1}}) + "\n")
         proc.stdin.flush()
-        proc.stdout.readline()
+
+        r, _, _ = select.select([proc.stdout], [], [], 3)
+        if not r:
+            return False
+        init_line = proc.stdout.readline()
+        if not init_line:
+            return False
 
         # authenticate
         proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "authenticate", "params": {"methodId": "oauth-personal"}}) + "\n")
@@ -362,18 +422,22 @@ def check_auth_status(server_bin: Optional[Path] = None) -> bool:
         r, _, _ = select.select([proc.stdout, proc.stderr], [], [], 3)
         if proc.stdout in r:
             line = proc.stdout.readline()
-            data = json.loads(line)
-            if "result" in data and not data.get("error"):
-                return True
+            if line:
+                data = json.loads(line)
+                if "result" in data and not data.get("error"):
+                    return True
         return False
     except Exception:
         return False
     finally:
-        proc.terminate()
         try:
-            proc.wait(timeout=2)
+            proc.terminate()
+            proc.wait(timeout=1)
         except Exception:
-            proc.kill()
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
 
 def cmd_auth(args):
@@ -382,6 +446,12 @@ def cmd_auth(args):
     if not server_bin.exists():
         print(f"Error: Server binary not found at {server_bin}. Run 'install' first.", file=sys.stderr)
         return 1
+
+    # Ensure executable permissions
+    try:
+        server_bin.chmod(0o755)
+    except Exception:
+        pass
 
     # Check existing auth
     if not getattr(args, "force", False) and check_auth_status(server_bin):
@@ -400,16 +470,23 @@ def cmd_auth(args):
         if p.exists():
             p.unlink()
 
-    print(f"Starting {server_bin.name}...")
-    proc = subprocess.Popen(
-        [str(server_bin)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        env=env,
-    )
+    server_cmd = get_server_command(server_bin)
+    cmd_str = " ".join(server_cmd)
+    print(f"Starting {server_bin.name} ({cmd_str})...")
+
+    try:
+        proc = subprocess.Popen(
+            server_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+    except Exception as e:
+        print(f"Error launching server process: {e}", file=sys.stderr)
+        return 1
 
     # 1. Initialize
     print("1. Sending JSON-RPC 'initialize'...")
@@ -422,9 +499,53 @@ def cmd_auth(args):
             "clientInfo": {"name": "agy-acp-cli", "version": "1.0.0"},
         },
     }
-    proc.stdin.write(json.dumps(init_req) + "\n")
-    proc.stdin.flush()
-    proc.stdout.readline()
+
+    try:
+        proc.stdin.write(json.dumps(init_req) + "\n")
+        proc.stdin.flush()
+    except (BrokenPipeError, OSError) as e:
+        time.sleep(0.3)
+        proc.poll()
+        err_out = proc.stderr.read() if proc.stderr else ""
+        print(f"\n❌ Failed to write to server (exit code: {proc.returncode}): {e}", file=sys.stderr)
+        if err_out.strip():
+            print(f"Server stderr:\n{err_out.strip()}", file=sys.stderr)
+        return 1
+
+    # Read initialize response with timeout
+    init_line = None
+    start_init = time.time()
+    while time.time() - start_init < 10:
+        if proc.poll() is not None:
+            break
+        r, _, _ = select.select([proc.stdout], [], [], 0.5)
+        if r:
+            init_line = proc.stdout.readline()
+            break
+
+    if not init_line:
+        time.sleep(0.2)
+        proc.poll()
+        err_out = proc.stderr.read() if proc.stderr else ""
+        print(f"\n❌ Server terminated unexpectedly during initialize (exit code: {proc.returncode})", file=sys.stderr)
+        if err_out.strip():
+            print(f"Server stderr:\n{err_out.strip()}", file=sys.stderr)
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        return 1
+
+    try:
+        init_data = json.loads(init_line)
+        if "error" in init_data:
+            print(f"\n❌ JSON-RPC initialize error: {init_data['error']}", file=sys.stderr)
+            proc.terminate()
+            return 1
+    except json.JSONDecodeError:
+        print(f"\n❌ Non-JSON response from server: {init_line.strip()}", file=sys.stderr)
+        proc.terminate()
+        return 1
 
     # 2. Authenticate
     print("2. Sending JSON-RPC 'authenticate' (method: oauth-personal)...")
@@ -434,8 +555,18 @@ def cmd_auth(args):
         "method": "authenticate",
         "params": {"methodId": "oauth-personal"},
     }
-    proc.stdin.write(json.dumps(auth_req) + "\n")
-    proc.stdin.flush()
+
+    try:
+        proc.stdin.write(json.dumps(auth_req) + "\n")
+        proc.stdin.flush()
+    except (BrokenPipeError, OSError) as e:
+        time.sleep(0.3)
+        proc.poll()
+        err_out = proc.stderr.read() if proc.stderr else ""
+        print(f"\n❌ Server pipe broken before authentication (exit code: {proc.returncode}): {e}", file=sys.stderr)
+        if err_out.strip():
+            print(f"Server stderr:\n{err_out.strip()}", file=sys.stderr)
+        return 1
 
     # 3. Intercept auth URL
     auth_url = None
@@ -443,6 +574,9 @@ def cmd_auth(args):
     start_wait = time.time()
 
     while time.time() - start_wait < 15:
+        if proc.poll() is not None:
+            break
+
         r, _, _ = select.select([proc.stderr], [], [], 0.5)
         if r:
             line = proc.stderr.readline()
@@ -465,8 +599,16 @@ def cmd_auth(args):
                 break
 
     if not auth_url:
-        print("Error: Could not retrieve authentication URL from server.", file=sys.stderr)
-        proc.terminate()
+        time.sleep(0.2)
+        proc.poll()
+        err_out = proc.stderr.read() if proc.stderr else ""
+        print(f"Error: Could not retrieve authentication URL from server (exit code: {proc.returncode}).", file=sys.stderr)
+        if err_out.strip():
+            print(f"Server stderr:\n{err_out.strip()}", file=sys.stderr)
+        try:
+            proc.terminate()
+        except Exception:
+            pass
         return 1
 
     print("\n" + "=" * 70)
@@ -511,7 +653,10 @@ def cmd_auth(args):
     try:
         while time.time() - start_time < timeout:
             if proc.poll() is not None:
-                print(f"Server process terminated with code {proc.returncode}")
+                err_out = proc.stderr.read() if proc.stderr else ""
+                print(f"Server process terminated unexpectedly with code {proc.returncode}")
+                if err_out.strip():
+                    print(f"Server output:\n{err_out.strip()}", file=sys.stderr)
                 break
 
             # Check stdout for success response
@@ -553,11 +698,14 @@ def cmd_auth(args):
     finally:
         stop_event.set()
         time.sleep(1)
-        proc.terminate()
         try:
+            proc.terminate()
             proc.wait(timeout=2)
         except Exception:
-            proc.kill()
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     return 0 if authenticated else 1
 
@@ -569,8 +717,14 @@ def cmd_run(args):
         print(f"Error: Binary not found at {server_bin}. Run 'install' first.", file=sys.stderr)
         return 1
 
+    try:
+        server_bin.chmod(0o755)
+    except Exception:
+        pass
+
+    server_cmd = get_server_command(server_bin)
     extra_args = getattr(args, "extra_args", [])
-    cmd = [str(server_bin.resolve())] + extra_args
+    cmd = server_cmd + extra_args
     os.execv(str(server_bin.resolve()), cmd)
 
 
@@ -598,18 +752,7 @@ def cmd_paseo(args):
     providers = agents.setdefault("providers", {})
 
     server_bin = get_server_binary_path()
-    cmd = [str(server_bin.resolve())]
-
-    # Check registry or args for extra flags
-    if getattr(args, "use_registry_args", False) or getattr(args, "use_uid", False):
-        try:
-            reg = fetch_registry_info()
-            for extra_arg in reg.get("args", []):
-                if extra_arg not in cmd:
-                    cmd.append(extra_arg)
-        except Exception:
-            if "--uid=" not in cmd:
-                cmd.append("--uid=")
+    cmd = get_server_command(server_bin)
 
     providers["antigravity"] = {
         "extends": "acp",
@@ -623,7 +766,7 @@ def cmd_paseo(args):
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config_data, f, indent=2)
 
-    print(f"✓ Updated {config_path} with antigravity provider configuration.")
+    print(f"✓ Updated {config_path} with antigravity provider configuration (command: {cmd}).")
 
     # Reload Paseo if running
     if shutil.which("paseo"):
