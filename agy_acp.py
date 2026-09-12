@@ -32,6 +32,7 @@ STATUS_FILE = BASE_DIR / "auth_status.json"
 PASEO_CONFIG = Path.home() / ".paseo" / "config.json"
 REGISTRY_CACHE_FILE = BASE_DIR / ".registry_cache.json"
 VERSION_FILE = BASE_DIR / "version.json"
+TOKEN_FILE = Path.home() / ".gemini" / "antigravity-acp" / "acp_token.json"
 
 # Official ACP Registry
 REGISTRY_URL = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json"
@@ -109,6 +110,23 @@ def get_platform_key() -> str:
         arch_str = machine
 
     return f"{sys_str}-{arch_str}"
+
+
+def kill_stale_server_processes():
+    """Kills any previous orphaned agy_acp_server processes to prevent lock/port contention."""
+    try:
+        me = os.getpid()
+        for line in subprocess.check_output(["ps", "-eo", "pid,comm,args"], text=True).splitlines():
+            if "agy_acp_server" in line:
+                parts = line.strip().split()
+                pid = int(parts[0])
+                if pid != me:
+                    try:
+                        os.kill(pid, 15)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 
 
 def fetch_registry_info() -> Dict[str, Any]:
@@ -242,13 +260,18 @@ def get_installed_version_info() -> Optional[Dict[str, Any]]:
 
 
 def setup_xdg_open_wrapper():
-    """Sets up bin/xdg-open interceptor that non-blockingly captures the URL."""
+    """Sets up bin/xdg-open interceptor that non-blockingly captures any passed URL."""
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     wrapper_path = BIN_DIR / "xdg-open"
 
-    # Fast wrapper: saves URL and exits immediately so server is never blocked
     script_content = f"""#!/bin/sh
-echo "$1" > "{AUTH_URL_FILE}"
+for arg in "$@"; do
+    case "$arg" in
+        http*)
+            echo "$arg" > "{AUTH_URL_FILE}"
+            ;;
+    esac
+done
 exit 0
 """
     with open(wrapper_path, "w", encoding="utf-8") as f:
@@ -338,7 +361,6 @@ def cmd_install(args):
         print(f"Extraction failed: {e}", file=sys.stderr)
         return 1
 
-    # Ensure all extracted executables have +x permissions
     for item in BASE_DIR.iterdir():
         if item.is_file() and (item.suffix in (".par", ".sh", ".exe") or "localharness" in item.name):
             try:
@@ -368,11 +390,21 @@ def cmd_install(args):
 
 
 def check_auth_status(server_bin: Optional[Path] = None) -> bool:
-    """Checks if agy_acp_server is already authenticated using non-blocking stream threads."""
+    """Checks if agy_acp_server is already authenticated."""
     if not server_bin:
         server_bin = get_server_binary_path()
     if not server_bin.exists():
         return False
+
+    # First check if token file exists on disk
+    if TOKEN_FILE.exists():
+        try:
+            with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+                td = json.load(f)
+                if td.get("refresh_token") or td.get("access_token"):
+                    return True
+        except Exception:
+            pass
 
     server_cmd = get_server_command(server_bin)
     try:
@@ -419,7 +451,6 @@ def check_auth_status(server_bin: Optional[Path] = None) -> bool:
 
         start = time.time()
         while time.time() - start < 4:
-            # Check for id: 2 result
             for line in stdout_queue:
                 if '"id":2' in line or '"id": 2' in line:
                     try:
@@ -429,7 +460,6 @@ def check_auth_status(server_bin: Optional[Path] = None) -> bool:
                     except json.JSONDecodeError:
                         pass
             if stderr_queue:
-                # If server printed auth prompt, it is NOT authenticated
                 for err_line in stderr_queue:
                     if "accounts.google.com" in err_line or "Open the following link" in err_line:
                         return False
@@ -466,6 +496,8 @@ def cmd_auth(args):
         print("✓ Already authenticated! Credentials are valid.")
         return 0
 
+    kill_stale_server_processes()
+    time.sleep(0.2)
     setup_xdg_open_wrapper()
 
     env = os.environ.copy()
@@ -589,17 +621,36 @@ def cmd_auth(args):
     auth_url = None
     listener_port = None
     start_wait = time.time()
-    authenticated = False
 
     while time.time() - start_wait < 15:
         if proc.poll() is not None:
             break
 
-        # Check if stdout already received the success response!
-        for line in stdout_queue:
+        # Check ALL lines in stdout and stderr
+        all_lines = list(stdout_queue) + list(stderr_queue)
+        for line in all_lines:
+            # Check for Auth URL
+            m = re.search(r"https://accounts\.google\.com/\S+", line)
+            if m:
+                auth_url = m.group(0)
+                port_m = re.search(r"redirect_uri=http%3A%2F%2F(?:127\.0\.0\.1|localhost)%3A(\d+)", auth_url)
+                if not port_m:
+                    port_m = re.search(r"http://(?:127\.0\.0\.1|localhost):(\d+)", auth_url)
+                if port_m:
+                    listener_port = int(port_m.group(1))
+                break
+
+            # Check for JSON-RPC id: 2 response
             if '"id":2' in line or '"id": 2' in line:
                 try:
                     resp = json.loads(line)
+                    if "error" in resp:
+                        print(f"\n❌ JSON-RPC authenticate error: {resp['error']}", file=sys.stderr)
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                        return 1
                     if "result" in resp:
                         print("\n🎉 Already authenticated! Credentials are valid.")
                         try:
@@ -610,25 +661,17 @@ def cmd_auth(args):
                 except json.JSONDecodeError:
                     pass
 
-        # Check stderr lines for auth URL
-        for line in stderr_queue:
-            m = re.search(r"https://accounts\.google\.com/\S+", line)
-            if m:
-                auth_url = m.group(0)
-                port_m = re.search(r"redirect_uri=http%3A%2F%2F127\.0\.0\.1%3A(\d+)%2F", auth_url)
-                if port_m:
-                    listener_port = int(port_m.group(1))
-                break
-
         if auth_url:
             break
 
         # Check AUTH_URL_FILE written by xdg-open wrapper
         if AUTH_URL_FILE.exists():
             content = AUTH_URL_FILE.read_text(encoding="utf-8").strip()
-            if content:
+            if content and "accounts.google.com" in content:
                 auth_url = content
-                port_m = re.search(r"redirect_uri=http%3A%2F%2F127\.0\.0\.1%3A(\d+)%2F", auth_url)
+                port_m = re.search(r"redirect_uri=http%3A%2F%2F(?:127\.0\.0\.1|localhost)%3A(\d+)", auth_url)
+                if not port_m:
+                    port_m = re.search(r"http://(?:127\.0\.0\.1|localhost):(\d+)", auth_url)
                 if port_m:
                     listener_port = int(port_m.group(1))
                 break
@@ -636,24 +679,15 @@ def cmd_auth(args):
         time.sleep(0.1)
 
     if not auth_url:
-        # Check if stdout has completed
-        for line in stdout_queue:
-            if '"id":2' in line or '"id": 2' in line:
-                try:
-                    resp = json.loads(line)
-                    if "result" in resp:
-                        print("\n🎉 Already authenticated! Credentials are valid.")
-                        proc.terminate()
-                        return 0
-                except json.JSONDecodeError:
-                    pass
-
         time.sleep(0.2)
         proc.poll()
-        err_out = "".join(stderr_queue)
+        err_out = "".join(stderr_queue).strip()
+        stdout_out = "".join(stdout_queue).strip()
         print(f"\n❌ Error: Could not retrieve authentication URL from server (exit code: {proc.returncode}).", file=sys.stderr)
-        if err_out.strip():
-            print(f"Server stderr:\n{err_out.strip()}", file=sys.stderr)
+        if stdout_out:
+            print(f"Server stdout:\n{stdout_out}", file=sys.stderr)
+        if err_out:
+            print(f"Server stderr:\n{err_out}", file=sys.stderr)
         try:
             proc.terminate()
         except Exception:
@@ -701,6 +735,7 @@ def cmd_auth(args):
     delivered_callback = False
     start_time = time.time()
     timeout = 600
+    authenticated = False
 
     try:
         while time.time() - start_time < timeout:
