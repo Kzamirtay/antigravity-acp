@@ -35,6 +35,9 @@ VERSION_FILE = BASE_DIR / "version.json"
 TOKEN_FILE = Path.home() / ".gemini" / "antigravity-acp" / "acp_token.json"
 SETTINGS_DIR = Path.home() / ".gemini" / "antigravity-acp"
 SETTINGS_FILE = SETTINGS_DIR / "settings.json"
+RUNNER_SCRIPT = BASE_DIR / "run_acp.sh"
+LIB_IPV4_SO = BASE_DIR / "libforce_ipv4.so"
+IPV4_SRC = BASE_DIR / "force_ipv4.c"
 
 # Official ACP Registry
 REGISTRY_URL = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json"
@@ -218,10 +221,93 @@ def get_server_binary_path(registry_info: Optional[Dict[str, Any]] = None) -> Pa
     return BASE_DIR / bin_name
 
 
+def ensure_runner_script() -> Path:
+    """Ensures run_acp.sh and libforce_ipv4.so (for environments like WSL2 where IPv6 drops packets) are configured."""
+    lh = BASE_DIR / "localharness_external"
+    if lh.exists():
+        try:
+            lh.chmod(0o755)
+        except Exception:
+            pass
+
+    # Compile libforce_ipv4.so if missing and gcc is available
+    if not LIB_IPV4_SO.exists() and shutil.which("gcc"):
+        try:
+            if not IPV4_SRC.exists():
+                IPV4_SRC.write_text("""#define _GNU_SOURCE
+#include <stddef.h>
+#include <dlfcn.h>
+#include <netdb.h>
+#include <sys/socket.h>
+
+static int (*real_getaddrinfo)(const char *node, const char *service,
+                               const struct addrinfo *hints,
+                               struct addrinfo **res) = NULL;
+
+int getaddrinfo(const char *node, const char *service,
+                const struct addrinfo *hints,
+                struct addrinfo **res) {
+    if (!real_getaddrinfo) {
+        real_getaddrinfo = (int (*)(const char *, const char *, const struct addrinfo *, struct addrinfo **))dlsym(RTLD_NEXT, "getaddrinfo");
+    }
+    struct addrinfo modified_hints;
+    if (hints) {
+        modified_hints = *hints;
+        if (modified_hints.ai_family == AF_UNSPEC) {
+            modified_hints.ai_family = AF_INET;
+        }
+        hints = &modified_hints;
+    } else {
+        struct addrinfo def_hints = {0};
+        def_hints.ai_family = AF_INET;
+        hints = &def_hints;
+    }
+    return real_getaddrinfo(node, service, hints, res);
+}
+""", encoding="utf-8")
+            subprocess.run(
+                ["gcc", "-shared", "-fPIC", "-O2", "-o", str(LIB_IPV4_SO), str(IPV4_SRC), "-ldl"],
+                capture_output=True,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    runner_content = """#!/usr/bin/env bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Force execute permissions on harness if missing
+if [ -f "$SCRIPT_DIR/localharness_external" ] && [ ! -x "$SCRIPT_DIR/localharness_external" ]; then
+    chmod 755 "$SCRIPT_DIR/localharness_external" 2>/dev/null || true
+fi
+
+# Prefer IPv4 in environments like WSL2 where IPv6 drops packets/times out
+if [ -f "$SCRIPT_DIR/libforce_ipv4.so" ]; then
+    export LD_PRELOAD="$SCRIPT_DIR/libforce_ipv4.so${LD_PRELOAD:+:$LD_PRELOAD}"
+fi
+
+exec "$SCRIPT_DIR/agy_acp_server.par" "--uid=" "$@"
+"""
+    try:
+        if not RUNNER_SCRIPT.exists() or RUNNER_SCRIPT.read_text(encoding="utf-8") != runner_content:
+            RUNNER_SCRIPT.write_text(runner_content, encoding="utf-8")
+        RUNNER_SCRIPT.chmod(0o755)
+    except Exception:
+        pass
+
+    return RUNNER_SCRIPT
+
+
 def get_server_command(server_bin: Optional[Path] = None, registry_info: Optional[Dict[str, Any]] = None) -> List[str]:
     """Builds the execution command line including required arguments from registry (e.g. --uid=)."""
     if not server_bin:
         server_bin = get_server_binary_path(registry_info)
+
+    runner = ensure_runner_script()
+    if runner.exists() and sys.platform.startswith("linux"):
+        return [str(runner.resolve())]
 
     cmd = [str(server_bin.resolve())]
 
@@ -429,10 +515,10 @@ def cmd_install(args):
             for info in z.infolist():
                 extracted_path = z.extract(info, BASE_DIR)
                 perm = (info.external_attr >> 16) & 0o777
-                if perm:
-                    os.chmod(extracted_path, perm | 0o755 if (perm & 0o111) else perm)
-                elif Path(extracted_path).suffix in (".par", ".sh") or "localharness" in info.filename:
+                if Path(extracted_path).suffix in (".par", ".sh", ".exe") or "localharness" in info.filename:
                     os.chmod(extracted_path, 0o755)
+                elif perm:
+                    os.chmod(extracted_path, perm | 0o755 if (perm & 0o111) else perm)
     except Exception as e:
         print(f"Extraction failed: {e}", file=sys.stderr)
         return 1
@@ -902,7 +988,7 @@ def cmd_run(args):
     server_cmd = get_server_command(server_bin)
     extra_args = getattr(args, "extra_args", [])
     cmd = server_cmd + extra_args
-    os.execv(str(server_bin.resolve()), cmd)
+    os.execv(cmd[0], cmd)
 
 
 def cmd_paseo(args):

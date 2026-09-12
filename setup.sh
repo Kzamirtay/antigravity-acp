@@ -9,6 +9,10 @@ if [ -d "$HOME/.local/bin" ] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
     export PATH="$HOME/.local/bin:$PATH"
 fi
 
+if [ -f "$SCRIPT_DIR/libforce_ipv4.so" ]; then
+    export LD_PRELOAD="$SCRIPT_DIR/libforce_ipv4.so${LD_PRELOAD:+:$LD_PRELOAD}"
+fi
+
 if ! command -v "$PYTHON_CMD" &>/dev/null; then
     echo "Error: python3 is not installed or not in PATH." >&2
     exit 1

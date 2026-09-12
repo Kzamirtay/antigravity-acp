@@ -59,7 +59,7 @@ cd ~/.local/share/antigravity-acp
      "extends": "acp",
      "label": "Antigravity",
      "command": [
-       "/home/<USER>/.local/share/antigravity-acp/agy_acp_server.par"
+       "/home/<USER>/.local/share/antigravity-acp/run_acp.sh"
      ],
      "params": {
        "supportsMcpServers": false

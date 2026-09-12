@@ -1,6 +1,7 @@
 # Large binaries and archives
 *.par
 *.zip
+*.so
 localharness_external
 
 # Temporary auth and log files
