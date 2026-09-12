@@ -33,6 +33,8 @@ PASEO_CONFIG = Path.home() / ".paseo" / "config.json"
 REGISTRY_CACHE_FILE = BASE_DIR / ".registry_cache.json"
 VERSION_FILE = BASE_DIR / "version.json"
 TOKEN_FILE = Path.home() / ".gemini" / "antigravity-acp" / "acp_token.json"
+SETTINGS_DIR = Path.home() / ".gemini" / "antigravity-acp"
+SETTINGS_FILE = SETTINGS_DIR / "settings.json"
 
 # Official ACP Registry
 REGISTRY_URL = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json"
@@ -264,11 +266,15 @@ def setup_xdg_open_wrapper():
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     wrapper_path = BIN_DIR / "xdg-open"
 
-    script_content = f"""#!/bin/sh
+    script_content = """#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 for arg in "$@"; do
     case "$arg" in
         http*)
-            echo "$arg" > "{AUTH_URL_FILE}"
+            echo "$arg" > "$SCRIPT_DIR/auth_url.txt"
+            if command -v powershell.exe >/dev/null 2>&1; then
+                powershell.exe -NoProfile -Command "Start-Process '$arg'" < /dev/null > /dev/null 2>&1 &
+            fi
             ;;
     esac
 done
@@ -306,6 +312,31 @@ def open_in_browser(url: str):
         return webbrowser.open(url)
     except Exception:
         return False
+
+
+def ensure_settings_json(auth_type: str = "oauth-personal") -> None:
+    """Ensures ~/.gemini/antigravity-acp/settings.json exists with auth.type configured.
+
+    Required by agy_acp_server when launched by ACP clients (like Paseo) without explicit
+    JSON-RPC authenticate calls.
+    """
+    try:
+        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+        settings = {}
+        if SETTINGS_FILE.exists():
+            try:
+                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    settings = json.load(f)
+            except Exception:
+                settings = {}
+        auth_sec = settings.setdefault("auth", {})
+        if auth_sec.get("type") != auth_type:
+            auth_sec["type"] = auth_type
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2)
+            print(f"✓ Configured auth.type='{auth_type}' in {SETTINGS_FILE}")
+    except Exception as e:
+        print(f"Warning: Could not update {SETTINGS_FILE}: {e}", file=sys.stderr)
 
 
 def cmd_install(args):
@@ -402,6 +433,7 @@ def check_auth_status(server_bin: Optional[Path] = None) -> bool:
             with open(TOKEN_FILE, "r", encoding="utf-8") as f:
                 td = json.load(f)
                 if td.get("refresh_token") or td.get("access_token"):
+                    ensure_settings_json("oauth-personal")
                     return True
         except Exception:
             pass
@@ -652,6 +684,7 @@ def cmd_auth(args):
                             pass
                         return 1
                     if "result" in resp:
+                        ensure_settings_json("oauth-personal")
                         print("\n🎉 Already authenticated! Credentials are valid.")
                         try:
                             proc.terminate()
@@ -752,6 +785,7 @@ def cmd_auth(args):
                     try:
                         resp = json.loads(line)
                         if "result" in resp:
+                            ensure_settings_json("oauth-personal")
                             print("\n🎉 Авторизация успешно завершена! (Authentication successful)")
                             authenticated = True
                             break
@@ -809,6 +843,7 @@ def cmd_auth(args):
 
 def cmd_run(args):
     """Executes the ACP server directly on stdio (for use by any ACP client/editor)."""
+    ensure_settings_json("oauth-personal")
     server_bin = get_server_binary_path()
     if not server_bin.exists():
         print(f"Error: Binary not found at {server_bin}. Run 'install' first.", file=sys.stderr)
@@ -827,6 +862,7 @@ def cmd_run(args):
 
 def cmd_paseo(args):
     """Configures Paseo (~/.paseo/config.json) to register the Antigravity ACP provider."""
+    ensure_settings_json("oauth-personal")
     config_path = Path(getattr(args, "config_path", str(PASEO_CONFIG))).expanduser()
     if not config_path.parent.exists():
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -954,6 +990,7 @@ def cmd_status(args):
 
 def cmd_setup(args):
     """End-to-end ACP setup: install from registry -> auth -> status."""
+    ensure_settings_json("oauth-personal")
     print(">>> Step 1: Checking and fetching binary from ACP Registry...")
     ret = cmd_install(args)
     if ret != 0:
