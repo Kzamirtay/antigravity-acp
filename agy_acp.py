@@ -873,6 +873,9 @@ def cmd_paseo(args):
             print("✓ Paseo daemon reloaded.")
             time.sleep(2)
             subprocess.run(["paseo", "provider", "ls"])
+        elif "ECONNREFUSED" in res.stderr:
+            print("ℹ️ Демон Paseo сейчас не запущен. Конфигурация успешно обновлена!")
+            print("Запустите демон командой: paseo start")
         else:
             print(f"Note: 'paseo reload' exited with code {res.returncode}: {res.stderr.strip()}")
     else:
