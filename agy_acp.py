@@ -1027,7 +1027,7 @@ def cmd_paseo(args):
         "label": "Antigravity",
         "command": cmd,
         "params": {
-            "supportsMcpServers": False
+            "supportsMcpServers": True
         },
     }
 
@@ -1036,14 +1036,76 @@ def cmd_paseo(args):
 
     print(f"✓ Updated {config_path} with antigravity provider configuration (command: {cmd}).")
 
+    # Also detect and update Windows Paseo if running inside WSL
+    if Path("/mnt/c/Users").exists():
+        for user_dir in Path("/mnt/c/Users").glob("*"):
+            win_paseo_dir = user_dir / ".paseo"
+            if win_paseo_dir.is_dir():
+                win_bridge_dst = win_paseo_dir / "acp_bridge.py"
+                src_bridge = BASE_DIR / "acp_bridge.py"
+                if src_bridge.exists():
+                    shutil.copy2(src_bridge, win_bridge_dst)
+                    print(f"✓ Copied acp_bridge.py to Windows Paseo: {win_bridge_dst}")
+
+                win_cfg_file = win_paseo_dir / "config.json"
+                win_cfg = {}
+                if win_cfg_file.exists():
+                    try:
+                        with open(win_cfg_file, "r", encoding="utf-8") as f:
+                            win_cfg = json.load(f)
+                    except Exception:
+                        pass
+
+                win_agents = win_cfg.setdefault("agents", {})
+                win_providers = win_agents.setdefault("providers", {})
+                win_user = user_dir.name
+
+                cand_pys = [
+                    user_dir / "AppData/Local/Programs/Python/Python311/python.exe",
+                    user_dir / "AppData/Local/Programs/Python/Python312/python.exe",
+                    user_dir / "AppData/Local/Programs/Python/Python310/python.exe",
+                    Path("/mnt/c/Program Files/Python311/python.exe"),
+                    Path("/mnt/c/Program Files/Python312/python.exe"),
+                    Path("/mnt/c/Windows/py.exe"),
+                ]
+                win_py = None
+                for cp in cand_pys:
+                    if cp.exists():
+                        try:
+                            rel = cp.relative_to(user_dir)
+                            win_py = f"C:/Users/{win_user}/{rel}".replace("\\", "/")
+                        except ValueError:
+                            win_py = str(cp).replace("/mnt/c/", "C:/").replace("\\", "/")
+                        break
+
+                if not win_py:
+                    win_py = f"C:/Users/{win_user}/AppData/Local/Programs/Python/Python311/python.exe"
+
+                win_bridge_path = f"C:/Users/{win_user}/.paseo/acp_bridge.py"
+                win_providers["antigravity"] = {
+                    "extends": "acp",
+                    "label": "Antigravity",
+                    "command": [win_py, "-u", win_bridge_path],
+                    "params": {
+                        "supportsMcpServers": True
+                    }
+                }
+
+                with open(win_cfg_file, "w", encoding="utf-8") as f:
+                    json.dump(win_cfg, f, indent=2)
+                print(f"✓ Configured Windows Paseo at {win_cfg_file}")
+
     # Reload Paseo if running
     if shutil.which("paseo"):
         print("Reloading Paseo daemon configuration...")
-        res = subprocess.run(["paseo", "reload"], capture_output=True, text=True)
+        env_win = os.environ.copy()
+        if Path("/mnt/c/Users/User/.paseo").exists():
+            env_win["PASEO_HOME"] = "/mnt/c/Users/User/.paseo"
+        res = subprocess.run(["paseo", "reload"], capture_output=True, text=True, env=env_win)
         if res.returncode == 0:
             print("✓ Paseo daemon reloaded.")
             time.sleep(2)
-            subprocess.run(["paseo", "provider", "ls"])
+            subprocess.run(["paseo", "provider", "ls"], env=env_win)
         elif "ECONNREFUSED" in res.stderr:
             print("ℹ️ Демон Paseo сейчас не запущен. Конфигурация успешно обновлена!")
             print("Запустите демон командой: paseo start")

@@ -26,10 +26,18 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List
 
 BASE_DIR = Path(__file__).resolve().parent
-SERVER_BIN = BASE_DIR / "agy_acp_server.par"
 LIB_IPV4_SO = BASE_DIR / "libforce_ipv4.so"
 HARNESS_BIN = BASE_DIR / "localharness_external"
 LOG_FILE = BASE_DIR / "bridge.log"
+
+# Force UTF-8 IO encoding on Windows
+if sys.platform == "win32":
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace", newline=None)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace", newline="\n")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # Maximum characters of file content to attach to prevent overwhelming stdio
 MAX_CONTENT_CHARS = 500_000
@@ -37,10 +45,30 @@ MAX_CONTENT_LINES = 5_000
 MAX_LOG_SIZE = 5 * 1024 * 1024
 
 
+def find_server_binary() -> Path:
+    """Locates the agy_acp_server binary dynamically on Linux or Windows."""
+    env_bin = os.environ.get("AGY_ACP_SERVER_BIN")
+    if env_bin and Path(env_bin).exists():
+        return Path(env_bin)
+
+    for name in ["agy_acp_server.exe", "agy_acp_server.par"]:
+        candidate = BASE_DIR / name
+        if candidate.exists():
+            return candidate
+
+    if sys.platform == "win32":
+        local_app = os.environ.get("LOCALAPPDATA", r"C:\Users\User\AppData\Local")
+        zed_cache = Path(local_app) / "Zed" / "external_agents" / "registry" / "antigravity-acp"
+        if zed_cache.exists():
+            exes = sorted(zed_cache.glob("*/agy_acp_server.exe"))
+            if exes:
+                return exes[-1]
+
+    return BASE_DIR / ("agy_acp_server.exe" if sys.platform == "win32" else "agy_acp_server.par")
+
+
 def log_debug(msg: str):
-    """Optional debug logger to inspect bridge communication."""
-    if not os.environ.get("AGY_ACP_DEBUG", "0") in ("1", "true", "True"):
-        return
+    """Debug logger to inspect bridge communication."""
     try:
         if LOG_FILE.exists() and LOG_FILE.stat().st_size > MAX_LOG_SIZE:
             LOG_FILE.unlink(missing_ok=True)
@@ -153,22 +181,25 @@ class AcpBridge:
         """Resolves relative file path against session cwd or working directory."""
         if not file_path:
             return file_path
-        if os.path.isabs(file_path):
-            return file_path
+
+        # Normalize slashes for current OS
+        clean_path = file_path.replace("/", os.sep).replace("\\", os.sep)
+        if os.path.isabs(clean_path):
+            return clean_path
 
         session_cwd = self.get_session_cwd(session_id)
         if session_cwd:
-            cand = os.path.join(session_cwd, file_path)
+            cand = os.path.join(session_cwd, clean_path)
             if os.path.exists(cand):
                 return os.path.abspath(cand)
 
-        cwd_cand = os.path.join(os.getcwd(), file_path)
+        cwd_cand = os.path.join(os.getcwd(), clean_path)
         if os.path.exists(cwd_cand):
             return os.path.abspath(cwd_cand)
 
         if session_cwd:
-            return os.path.abspath(os.path.join(session_cwd, file_path))
-        return file_path
+            return os.path.abspath(os.path.join(session_cwd, clean_path))
+        return clean_path
 
     def start_server(self):
         env = os.environ.copy()
@@ -184,8 +215,9 @@ class AcpBridge:
             existing = env.get("LD_PRELOAD", "")
             env["LD_PRELOAD"] = f"{LIB_IPV4_SO}:{existing}" if existing else str(LIB_IPV4_SO)
 
-        cmd = [str(SERVER_BIN)]
-        if "--uid=" not in self.server_args:
+        server_bin = find_server_binary()
+        cmd = [str(server_bin)]
+        if str(server_bin).endswith(".par") and "--uid=" not in self.server_args:
             cmd.append("--uid=")
         cmd.extend(self.server_args)
 
@@ -194,11 +226,14 @@ class AcpBridge:
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=sys.stderr,
+            stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             env=env,
         )
+        log_debug(f"Server process started with PID: {self.proc.pid}")
 
     def handle_client_line(self, line: str):
         """Extracts workspace cwd and session information from client requests."""
@@ -239,12 +274,14 @@ class AcpBridge:
             for line in iter(sys.stdin.readline, ""):
                 if not line:
                     break
+                log_debug(f">>> CLIENT: {line.strip()[:160]}")
                 self.handle_client_line(line)
                 if self.proc and self.proc.stdin:
                     self.proc.stdin.write(line)
                     self.proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            pass
+            log_debug("Client stdin reached EOF")
+        except (BrokenPipeError, OSError) as e:
+            log_debug(f"forward_stdin error: {e}")
         finally:
             if self.proc and self.proc.stdin:
                 try:
@@ -252,8 +289,20 @@ class AcpBridge:
                 except Exception:
                     pass
 
+    def forward_stderr(self):
+        """Forwards and logs stderr from agy_acp_server."""
+        try:
+            if self.proc and self.proc.stderr:
+                for line in iter(self.proc.stderr.readline, ""):
+                    if not line:
+                        break
+                    log_debug(f"[SERVER STDERR] {line.strip()}")
+        except Exception as e:
+            log_debug(f"forward_stderr exception: {e}")
+
     def transform_server_line(self, line: str) -> str:
         """Inspects and enriches server output lines before passing to client."""
+        log_debug(f"<<< SERVER: {line.strip()[:160]}")
         stripped = line.strip()
         if not stripped.startswith("{") or not stripped.endswith("}"):
             return line
@@ -655,7 +704,11 @@ class AcpBridge:
         t_in = threading.Thread(target=self.forward_stdin, daemon=True, name="ClientToBridge")
         t_in.start()
 
+        t_err = threading.Thread(target=self.forward_stderr, daemon=True, name="ServerStderr")
+        t_err.start()
+
         def handle_signal(sig, _frame):
+            log_debug(f"Received signal {sig}, terminating server...")
             if self.proc:
                 try:
                     self.proc.terminate()
@@ -663,8 +716,12 @@ class AcpBridge:
                     pass
             sys.exit(0)
 
-        signal.signal(signal.SIGINT, handle_signal)
-        signal.signal(signal.SIGTERM, handle_signal)
+        try:
+            signal.signal(signal.SIGINT, handle_signal)
+            if hasattr(signal, "SIGTERM"):
+                signal.signal(signal.SIGTERM, handle_signal)
+        except Exception:
+            pass
 
         try:
             for line in iter(self.proc.stdout.readline, ""):
@@ -673,8 +730,9 @@ class AcpBridge:
                 transformed = self.transform_server_line(line)
                 sys.stdout.write(transformed if transformed.endswith("\n") else transformed + "\n")
                 sys.stdout.flush()
-        except (BrokenPipeError, OSError):
-            pass
+            log_debug(f"Server stdout reached EOF, returncode={self.proc.poll()}")
+        except (BrokenPipeError, OSError) as e:
+            log_debug(f"Client stdout pipe error: {e}")
         finally:
             if self.proc:
                 try:
