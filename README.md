@@ -10,83 +10,114 @@
 
 ---
 
-## 🚀 Быстрый старт (ACP Сервер)
+## 💻 Режимы работы: Linux и Windows
 
+Репозиторий поддерживает два полноценных режима работы (а также их совместную связку в WSL2):
+
+```
+       ┌─────────────────────────────────────────────────────────┐
+       │             Google Antigravity ACP Manager              │
+       └────────────────────────────┬────────────────────────────┘
+                                    │
+           ┌────────────────────────┴────────────────────────┐
+           ▼                                                 ▼
+  🐧 Режим Linux / WSL                              🪟 Режим Windows (Native)
+  • Лаунчер: ./setup.sh                             • Лаунчер: .\setup.ps1 или setup.cmd
+  • Бинарник: agy_acp_server.par                    • Бинарник: agy_acp_server.exe
+  • Раннер: run_acp.sh                              • Раннер: run_acp.cmd
+  • Конфиг: ~/.paseo/config.json                    • Конфиг: %USERPROFILE%\.paseo\config.json
+```
+
+---
+
+## 🚀 Быстрый старт
+
+### 🐧 Режим Linux / WSL
 ```bash
 git clone https://github.com/Kzamirtay/antigravity-acp.git ~/.local/share/antigravity-acp
 cd ~/.local/share/antigravity-acp
 ./setup.sh
 ```
 
-Команда `./setup.sh` (или `./setup.sh setup`) выполнит:
-1. Проверку наличия установленного Google Antigravity CLI (`agy`).
-2. Запрос к **ACP Registry** и скачивание актуального релиза `agy_acp_server` под вашу ОС и архитектуру.
-3. Авторизацию в Google через протокол ACP (JSON-RPC stdio).
-4. Проверку готовности агента.
+### 🪟 Режим Windows (PowerShell или CMD)
+```powershell
+git clone https://github.com/Kzamirtay/antigravity-acp.git C:\antigravity-acp
+cd C:\antigravity-acp
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+```
+*(Или в командной строке CMD: `setup.cmd`)*
 
-После этого сервер Antigravity полностью готов к работе с любым ACP-клиентом!
-
----
-
-## 🧭 Команды CLI (`./setup.sh` / `agy_acp.py`)
-
-Инструмент написан на чистом **Python 3** без внешних `pip`-зависимостей.
-
-| Команда | Назначение |
-|---|---|
-| `./setup.sh` (или `setup`) | **Базовый сетап ACP**: проверка `agy` + скачивание из реестра + Google OAuth + проверка |
-| `./setup.sh check-agy` | Проверка наличия и версии Google Antigravity CLI (`agy`) |
-| `./setup.sh status` | Проверка `agy`, реестра, наличия обновлений, локального файла и OAuth-токена |
-| `./setup.sh install [--force]` | Загрузка и распаковка актуального релиза из ACP Registry |
-| `./setup.sh auth [--force]` | Запуск только процесса авторизации (OAuth JSON-RPC) |
-| `./setup.sh run [args...]` | Прямой запуск ACP сервера по `stdio` (для вызова редакторами/агентами) |
-| **`./setup.sh paseo`** | **Интеграция с Paseo**: авто-запись провайдера в `~/.paseo/config.json` и `paseo reload` |
-
----
-
-## 🎯 Подключение к Paseo (отдельная команда)
-
-Для регистрации провайдера Antigravity в платформе [Paseo](https://getpaseo.com) выполните:
-
+### 🔄 Двойной режим (WSL2 + Windows Host)
+Если вы запускаете скрипты из WSL2, но Paseo Desktop установлен на Windows:
 ```bash
-./setup.sh paseo
+./setup.sh paseo windows   # Настроить только Windows Paseo
+./setup.sh paseo all       # Настроить и Linux, и Windows Paseo
+./setup.sh status all      # Полный статус для обоих окружений
+```
+
+---
+
+## 🧭 Команды CLI
+
+Инструмент написан на чистом **Python 3** (3.10+) без сторонних `pip`-зависимостей.
+
+| Linux / WSL команда | Windows (PowerShell) | Windows (CMD) | Назначение |
+|---|---|---|---|
+| `./setup.sh` | `.\setup.ps1` | `setup.cmd` | **Базовый сетап ACP**: проверка `agy` + скачивание + Google OAuth + статус |
+| `./setup.sh paseo [linux\|windows\|all]` | `.\setup.ps1 paseo` | `setup.cmd paseo` | **Интеграция с Paseo**: настройка конфига и моста, `paseo reload` |
+| `./setup.sh status [linux\|windows\|all]` | `.\setup.ps1 status` | `setup.cmd status` | Проверка `agy`, Python, реестра, бинарников, моста и Paseo |
+| `./setup.sh install [linux\|windows\|all]` | `.\setup.ps1 install` | `setup.cmd install` | Загрузка бинарников (`.par` или `.exe`) из ACP Registry |
+| `./setup.sh auth` | `.\setup.ps1 auth` | `setup.cmd auth` | Запуск только процесса авторизации (OAuth JSON-RPC) |
+| `./setup.sh check-agy` | `.\setup.ps1 check-agy` | `setup.cmd check-agy` | Проверка наличия и версии Google Antigravity CLI (`agy`) |
+| `./setup.sh run [args...]` | `.\run_acp.cmd` | `run_acp.cmd` | Прямой запуск ACP сервера по `stdio` |
+
+---
+
+## 🎯 Подключение к Paseo
+
+### Для Windows Paseo (из PowerShell или CMD):
+```powershell
+.\setup.ps1 paseo
+```
+
+### Для Linux Paseo:
+```bash
+./setup.sh paseo linux
+```
+
+### Из WSL для Windows Paseo:
+```bash
+./setup.sh paseo windows
 ```
 
 Команда автоматически:
-1. Создаст резервную копию `~/.paseo/config.json.bak`.
-2. Добавит секцию `antigravity` в `agents.providers`:
-   ```json
-   "antigravity": {
-     "extends": "acp",
-     "label": "Antigravity",
-     "command": [
-       "/home/<USER>/.local/share/antigravity-acp/run_acp.sh"
-     ],
-     "params": {
-       "supportsMcpServers": false
-     }
-   }
-   ```
-3. Перезагрузит конфигурацию демона через `paseo reload` и выведет статус:
-   ```text
-   PROVIDER      LABEL         STATUS     ENABLED   DEFAULT MODE   MODES
-   antigravity   Antigravity   available  Enabled   default        Default, Auto Edit, YOLO
-   ```
+1. Создаст резервную копию `config.json.bak`.
+2. Развернет `acp_bridge.py` в каталог `.paseo`.
+3. Добавит секцию `antigravity` в `agents.providers`:
+   - **Linux**: вызывает `/path/to/antigravity-acp/run_acp.sh`.
+   - **Windows**: вызывает `python.exe -u C:/.../.paseo/acp_bridge.py`.
+4. Перезагрузит демон через `paseo reload` и проверит статус (`available`).
 
-*Флаг `--use-registry-args` (или `--use-uid`) опционально добавляет рекомендованные реестром аргументы (например, `--uid=`).*
+---
+
+## 👁️ Умный ACP-мост (`acp_bridge.py`)
+
+Сервер `agy_acp_server` по умолчанию отдает минимальные данные о действиях агента. Для Paseo и других клиентов мост прозрачно обогащает поток:
+- **Read (`view_file`)**: Безопасно считывает срез строк файла с диска по `cwd` сессии и передает его в UI Paseo. В результате в блоке вызова отображается подсвеченный синтаксисом код и номера строк (вместо *"Дополнительные сведения отсутствуют"*).
+- **Edit (`replace_file_content`) / Write (`write_to_file`)**: Формирует полноценный unified diff (`--- a/...`, `+++ b/...`, `@@`, `+`, `-`) через `difflib`. Интерфейс Paseo распознает изменения и отображает интерактивный цветной дифф с удаленными и добавленными строками (вместо *"Нет изменений для отображения"*).
 
 ---
 
 ## 🛠 Подключение к другим ACP-клиентам (Zed, Cursor и др.)
 
-Вы можете использовать скомпилированный бинарник напрямую или запускать его через скрипт:
+Вы можете использовать скомпилированный бинарник или раннер:
 
-- **Прямой бинарник**:
-  `~/.local/share/antigravity-acp/agy_acp_server.par`
-- **Через CLI-раннер**:
-  `~/.local/share/antigravity-acp/setup.sh run`
-
----
+- **Linux / macOS**:
+  - Прямой бинарник: `~/.local/share/antigravity-acp/agy_acp_server.par`
+  - Через раннер с мостом: `~/.local/share/antigravity-acp/run_acp.sh`
+- **Windows**:
+  - Прямой бинарник: `C:\antigravity-acp\agy_acp_server.exe`
+  - Через раннер с мостом: `C:\antigravity-acp\run_acp.cmd`
 
 ## 💡 Как устроен процесс авторизации
 
