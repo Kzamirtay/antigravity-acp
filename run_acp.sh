@@ -8,7 +8,10 @@ if [ -f "$SCRIPT_DIR/localharness_external" ] && [ ! -x "$SCRIPT_DIR/localharnes
     chmod 755 "$SCRIPT_DIR/localharness_external" 2>/dev/null || true
 fi
 
-# Prefer IPv4 in environments like WSL2 where IPv6 drops packets/times out
+if [ -f "$SCRIPT_DIR/acp_bridge.py" ]; then
+    exec python3 "$SCRIPT_DIR/acp_bridge.py" "$@"
+fi
+
 if [ -f "$SCRIPT_DIR/libforce_ipv4.so" ]; then
     export LD_PRELOAD="$SCRIPT_DIR/libforce_ipv4.so${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
