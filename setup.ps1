@@ -2,25 +2,20 @@
 .SYNOPSIS
     Google Antigravity ACP Setup & Manager for Windows PowerShell
 .DESCRIPTION
-    Dual-mode manager for Google Antigravity ACP Server, OAuth authentication,
+    Setup and management script for Google Antigravity ACP Server, OAuth authentication,
     transparent tool bridge (Read slice & Edit diff), and Paseo integration on Windows.
 .EXAMPLE
+    .\setup.ps1
     .\setup.ps1 paseo
     .\setup.ps1 status
     .\setup.ps1 auth
     .\setup.ps1 install
-    .\setup.ps1 setup
+    .\setup.ps1 check-agy
 #>
 
 param(
-    [Parameter(Position=0)]
-    [string]$Command = "setup",
-
-    [Parameter(Position=1)]
-    [string]$Target = "windows",
-
-    [switch]$Force,
-    [switch]$SkipAgyCheck
+    [Parameter(Position=0, ValueFromRemainingArguments=$true)]
+    [string[]]$Arguments = @("setup")
 )
 
 $ErrorActionPreference = "Stop"
@@ -56,17 +51,5 @@ if (-not $PythonCmd) {
 }
 
 $ScriptPath = Join-Path $ScriptDir "agy_acp.py"
-$ArgsList = @($ScriptPath, $Command)
-
-if ($Target) {
-    $ArgsList += $Target
-}
-if ($Force) {
-    $ArgsList += "--force"
-}
-if ($SkipAgyCheck) {
-    $ArgsList += "--skip-agy-check"
-}
-
-& $PythonCmd $ArgsList
+& $PythonCmd $ScriptPath @Arguments
 exit $LASTEXITCODE
