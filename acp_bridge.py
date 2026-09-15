@@ -17,6 +17,7 @@ Transforms and enriches Antigravity tool notifications:
 
 import sys
 import os
+import re
 import json
 import signal
 import difflib
@@ -155,16 +156,117 @@ def generate_unified_diff(old_str: Optional[str], new_str: Optional[str], file_p
     return "\n".join(diff) + "\n"
 
 
+def discover_skills(cwd: Optional[str] = None) -> Dict[str, str]:
+    """Discovers workspace and global Antigravity skills from SKILL.md files."""
+    skills: Dict[str, str] = {}
+    search_dirs: List[Path] = []
+
+    if cwd:
+        p_cwd = Path(cwd)
+        search_dirs.extend([
+            p_cwd / ".agents" / "skills",
+            p_cwd / ".agent" / "skills",
+            p_cwd / ".gemini" / "skills",
+        ])
+
+    candidates: List[Path] = [Path.home() / ".gemini"]
+
+    user_prof = os.environ.get("USERPROFILE")
+    if user_prof:
+        candidates.append(Path(user_prof) / ".gemini")
+
+    if os.path.isdir("/mnt/c/Users"):
+        for u in Path("/mnt/c/Users").iterdir():
+            cand = u / ".gemini"
+            if cand.is_dir():
+                candidates.append(cand)
+
+    for g_dir in candidates:
+        if not g_dir.is_dir():
+            continue
+        search_dirs.extend([
+            g_dir / "antigravity-cli" / "builtin" / "skills",
+            g_dir / "antigravity-cli" / "skills",
+            g_dir / "antigravity" / "builtin" / "skills",
+            g_dir / "config" / "skills",
+        ])
+        for plug_parent in [g_dir / "antigravity-cli" / "plugins", g_dir / "extensions"]:
+            if plug_parent.is_dir():
+                for p in plug_parent.iterdir():
+                    if (p / "skills").is_dir():
+                        search_dirs.append(p / "skills")
+                    if (p / "workflow-skills").is_dir():
+                        search_dirs.append(p / "workflow-skills")
+
+    for sdir in search_dirs:
+        if not sdir.is_dir():
+            continue
+        for skill_md in sdir.glob("**/SKILL.md"):
+            try:
+                name = skill_md.parent.name
+                desc = f"Skill: {name}"
+                with open(skill_md, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+                in_front = False
+                desc_lines = []
+                collecting_desc = False
+                for line in lines:
+                    sline = line.strip()
+                    if sline == "---":
+                        if in_front:
+                            break
+                        in_front = True
+                        continue
+                    if in_front:
+                        if sline.startswith("name:"):
+                            collecting_desc = False
+                            val = sline.split("name:", 1)[1].strip().strip("\"'")
+                            if val:
+                                name = val
+                        elif sline.startswith("description:"):
+                            val = sline.split("description:", 1)[1].strip().strip("\"'").lstrip(">-").strip()
+                            desc_lines = [val] if val else []
+                            collecting_desc = True
+                        elif collecting_desc:
+                            if line.startswith("  ") or line.startswith("\t"):
+                                desc_lines.append(sline)
+                            else:
+                                collecting_desc = False
+                if desc_lines:
+                    clean_desc = " ".join(desc_lines).strip()
+                    if clean_desc:
+                        desc = clean_desc
+                safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+                if safe_name and safe_name not in skills:
+                    skills[safe_name] = desc[:150]
+            except Exception as e:
+                log_debug(f"Error reading skill {skill_md}: {e}")
+
+    return skills
+
+
 class AcpBridge:
     def __init__(self, server_args):
         self.server_args = server_args
         self.active_tool_calls: Dict[str, Dict[str, Any]] = {}
         self.pending_cwds: Dict[Any, str] = {}  # req_id -> cwd
         self.session_cwds: Dict[str, str] = {}  # sessionId -> cwd
+        self.skills_cache: Dict[str, Dict[str, str]] = {}  # cwd -> {name: desc}
         self.active_session_id: Optional[str] = None
         self.default_cwd: str = os.getcwd()
         self.lock = threading.Lock()
         self.proc: Optional[subprocess.Popen] = None
+
+    def get_skills(self, session_id: Optional[str] = None) -> Dict[str, str]:
+        """Retrieves or discovers skills available for the session."""
+        cwd = self.get_session_cwd(session_id)
+        with self.lock:
+            if cwd in self.skills_cache:
+                return self.skills_cache[cwd]
+        skills = discover_skills(cwd)
+        with self.lock:
+            self.skills_cache[cwd] = skills
+        return skills
 
     def get_session_cwd(self, session_id: Optional[str] = None) -> str:
         """Returns the current working directory associated with the session."""
@@ -235,15 +337,15 @@ class AcpBridge:
         )
         log_debug(f"Server process started with PID: {self.proc.pid}")
 
-    def handle_client_line(self, line: str):
-        """Extracts workspace cwd and session information from client requests."""
+    def handle_client_line(self, line: str) -> str:
+        """Extracts workspace cwd, session info, and transforms skill slash commands."""
         stripped = line.strip()
         if not (stripped.startswith("{") and stripped.endswith("}")):
-            return
+            return line
         try:
             msg = json.loads(line)
         except Exception:
-            return
+            return line
 
         method = msg.get("method")
         req_id = msg.get("id")
@@ -268,6 +370,26 @@ class AcpBridge:
                 with self.lock:
                     self.active_session_id = sess_id
 
+            prompt_blocks = params.get("prompt")
+            if isinstance(prompt_blocks, list):
+                skills = self.get_skills(sess_id)
+                modified = False
+                for block in prompt_blocks:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text", "")
+                        match = re.match(r"^/([a-zA-Z0-9_-]+)(?:\s+(.*)|\s*$)", text, re.DOTALL)
+                        if match:
+                            cmd_name = match.group(1)
+                            rest = match.group(2) or ""
+                            if cmd_name in skills:
+                                block["text"] = f"Activate skill '{cmd_name}' and follow its instructions.\n\n{rest}".strip()
+                                modified = True
+                                log_debug(f"Transformed client prompt /{cmd_name} -> skill activation")
+                if modified:
+                    return json.dumps(msg, ensure_ascii=False) + "\n"
+
+        return line
+
     def forward_stdin(self):
         """Forwards input from ACP client (Paseo) to agy_acp_server."""
         try:
@@ -275,9 +397,9 @@ class AcpBridge:
                 if not line:
                     break
                 log_debug(f">>> CLIENT: {line.strip()[:160]}")
-                self.handle_client_line(line)
+                transformed = self.handle_client_line(line)
                 if self.proc and self.proc.stdin:
-                    self.proc.stdin.write(line)
+                    self.proc.stdin.write(transformed)
                     self.proc.stdin.flush()
             log_debug("Client stdin reached EOF")
         except (BrokenPipeError, OSError) as e:
@@ -343,6 +465,25 @@ class AcpBridge:
             return line
 
         update_type = update.get("sessionUpdate")
+
+        # -------------------------------------------------------------
+        # 0. Available Commands Update (Slash commands & Skills)
+        # -------------------------------------------------------------
+        if update_type == "available_commands_update":
+            commands = update.get("availableCommands") or []
+            existing_names = {c.get("name") for c in commands if isinstance(c, dict)}
+
+            skills = self.get_skills(session_id)
+            for skill_name, skill_desc in skills.items():
+                if skill_name not in existing_names:
+                    commands.append({
+                        "name": skill_name,
+                        "description": f"Skill: {skill_desc}",
+                    })
+
+            update["availableCommands"] = commands
+            log_debug(f"Enriched availableCommands with {len(skills)} skills: {list(skills.keys())}")
+            return json.dumps(msg, ensure_ascii=False)
 
         # -------------------------------------------------------------
         # 1. Tool Call Started: sessionUpdate == "tool_call"
